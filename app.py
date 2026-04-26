@@ -1,12 +1,10 @@
 """
-Rise City Facebook Scraper API - V6 🎩
-BIG UPDATE: Tìm view count qua DOM element (icon 👁) thay vì JSON regex
-- Click play video → trigger view counter
-- Wait for view counter element to appear
-- Multiple selector fallbacks cho icon 👁
-- Parse Vietnamese number format (1,5K = 1500)
+Rise City Facebook Scraper API - V6.1 with CORS 🎩
+Updates from V6:
++ Added CORS headers (allow Hoppscotch Browser, Lovable Edge Function, etc.)
++ Same V6 features: Mobile viewport, DOM extraction, multi-strategy view extraction
 """
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
 import os
 import re
@@ -21,6 +19,25 @@ app = Flask(__name__)
 
 COOKIES_PATH = os.getenv('FB_COOKIES_PATH', '/etc/secrets/cookies.txt')
 API_SECRET = os.getenv('API_SECRET', 'rise-city-secret-2026')
+
+
+# === CORS MIDDLEWARE ===
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key, x-api-key, Authorization'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
+
+
+@app.route('/scrape', methods=['OPTIONS'])
+@app.route('/health', methods=['OPTIONS'])
+@app.route('/', methods=['OPTIONS'])
+def handle_options():
+    """Handle CORS preflight"""
+    response = make_response('', 204)
+    return response
 
 
 def decode_unicode_string(s):
@@ -59,19 +76,11 @@ def parse_netscape_cookies(cookies_path):
 
 
 def parse_vietnamese_number(text):
-    """
-    Parse Vietnamese-formatted numbers:
-    '1,5K' or '1.5K' -> 1500
-    '2,3M' -> 2300000
-    '15K' -> 15000
-    '1.234' -> 1234
-    """
+    """Parse '1,5K' -> 1500, '2,3M' -> 2300000, etc."""
     if not text:
         return 0
     
     s = str(text).strip()
-    
-    # Find pattern: number (with comma/period decimal) + optional suffix
     match = re.match(r'([\d.,]+)\s*([KkMmBbTrtr]+)?', s)
     if not match:
         return 0
@@ -79,24 +88,18 @@ def parse_vietnamese_number(text):
     num_str = match.group(1)
     suffix = match.group(2)
     
-    # Replace Vietnamese decimal: 1,5 -> 1.5
-    # But also handle 1.234 (thousand separator)
     if ',' in num_str and '.' in num_str:
-        # Both present: comma is thousands, period is decimal (US format)
         num_str = num_str.replace(',', '')
     elif ',' in num_str:
-        # Only comma: could be thousands (1,234) or decimal (1,5)
-        # Heuristic: if has 3 digits after comma, it's thousands
         parts = num_str.split(',')
         if len(parts) == 2 and len(parts[1]) == 3:
-            num_str = num_str.replace(',', '')  # 1,234 -> 1234
+            num_str = num_str.replace(',', '')
         else:
-            num_str = num_str.replace(',', '.')  # 1,5 -> 1.5
+            num_str = num_str.replace(',', '.')
     elif '.' in num_str:
-        # Only period: could be thousands (1.234) or decimal (1.5)
         parts = num_str.split('.')
         if len(parts) == 2 and len(parts[1]) == 3:
-            num_str = num_str.replace('.', '')  # 1.234 -> 1234
+            num_str = num_str.replace('.', '')
     
     try:
         num = float(num_str)
@@ -143,33 +146,28 @@ def scrape_with_playwright(url):
             browser = p.chromium.launch(
                 headless=True,
                 args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox', '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled',
                     '--disable-features=IsolateOrigins,site-per-process',
-                    '--disable-gpu',
-                    '--no-first-run',
-                    '--autoplay-policy=no-user-gesture-required',  # Auto play video
+                    '--disable-gpu', '--no-first-run',
+                    '--autoplay-policy=no-user-gesture-required',
                 ]
             )
             
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 414, 'height': 896},  # Mobile viewport!
+                viewport={'width': 414, 'height': 896},
                 locale='vi-VN',
                 timezone_id='Asia/Ho_Chi_Minh',
-                is_mobile=True,  # Pretend to be mobile (FB shows view counter clearer on mobile)
+                is_mobile=True,
                 has_touch=True,
                 extra_http_headers={
-                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 }
             )
             
             context.add_cookies(cookies)
-            logger.info(f'Injected {len(cookies)} cookies')
-            
             page = context.new_page()
             
             page.add_init_script("""
@@ -178,32 +176,24 @@ def scrape_with_playwright(url):
                 Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
             """)
             
-            # Convert /share/r/ URL to /reel/ format if possible by extracting post_id from HTML first
             logger.info(f'Navigating to: {url}')
             response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
-            
-            # Wait initial load
             time.sleep(5)
             
-            # Get post_id from current page to construct cleaner URL
             html = page.content()
             post_id_match = re.search(r'"video_id[":\s]*"(\d+)"', html) or \
                            re.search(r'"top_level_post_id[":\s]*"(\d+)"', html)
             
             if post_id_match:
                 post_id = post_id_match.group(1)
-                # Try direct reel URL with mobile prefix (more likely to show view counter)
                 reel_url = f'https://m.facebook.com/reel/{post_id}'
                 logger.info(f'Trying mobile reel URL: {reel_url}')
                 try:
                     page.goto(reel_url, wait_until='domcontentloaded', timeout=30000)
                     time.sleep(8)
                 except Exception as e:
-                    logger.warning(f'Mobile reel URL failed: {e}, falling back')
-                    # Fall back to original
-                    pass
+                    logger.warning(f'Mobile reel URL failed: {e}')
             
-            # Scroll and wait for lazy load
             try:
                 page.evaluate('window.scrollTo(0, 100)')
                 time.sleep(2)
@@ -214,7 +204,6 @@ def scrape_with_playwright(url):
             except:
                 pass
             
-            # Wait extra for view counter to load
             time.sleep(5)
             
             final_url = page.url
@@ -227,18 +216,13 @@ def scrape_with_playwright(url):
                 browser.close()
                 return result
             
-            # Get final HTML
             html = page.content()
             result['debug']['html_length'] = len(html)
             
-            # === EXTRACT VIEWS - MULTIPLE STRATEGIES ===
             views = extract_views_multistrategy(page, html, result['debug'])
-            
-            # Extract other fields from HTML
             extracted = extract_from_html(html)
             result['debug']['extracted_data'] = extracted
             
-            # Build result
             result['data']['views'] = views
             result['data']['likes'] = extracted.get('likes', 0)
             result['data']['comments'] = extracted.get('comments', 0)
@@ -264,16 +248,11 @@ def scrape_with_playwright(url):
 
 
 def extract_views_multistrategy(page, html, debug_info):
-    """
-    Try multiple strategies to extract view count.
-    Returns the highest non-zero value found.
-    """
     attempts = []
     candidate_views = []
     
-    # === STRATEGY 1: HTML regex patterns ===
+    # Strategy 1: HTML regex
     html_patterns = [
-        # FB internal patterns
         r'"video_view_count[":\s]*(\d+)',
         r'"video_view_count_renderer"[^}]*"count[":\s]*(\d+)',
         r'"play_count[":\s]*(\d+)',
@@ -282,11 +261,7 @@ def extract_views_multistrategy(page, html, debug_info):
         r'"reels_view_count[":\s]*(\d+)',
         r'"organic_view_count[":\s]*(\d+)',
         r'"playbackVideoMetadata"[^}]*"viewCount[":\s]*(\d+)',
-        # Display text patterns
         r'"video_view_count_text"[^}]*"text[":\s]*"([^"]+)"',
-        r'"video_view_count_renderer"[^}]*"text"[^}]*"text[":\s]*"([^"]+)"',
-        # Vietnamese text patterns
-        r'(\d[\d.,]*[KkMmBb]?)\s*(?:l\\u01b0\\u1ee3t xem|l\\u1ea7n xem|views?)',
     ]
     
     for pattern in html_patterns:
@@ -295,100 +270,36 @@ def extract_views_multistrategy(page, html, debug_info):
             value = parse_vietnamese_number(match.group(1))
             if value > 0:
                 candidate_views.append(value)
-                attempts.append({'strategy': 'html_regex', 'pattern': pattern[:50], 'value': value})
+                attempts.append({'strategy': 'html_regex', 'value': value})
     
-    # === STRATEGY 2: DOM selectors for view counter element ===
-    try:
-        # FB uses various selectors for view counter
-        selectors = [
-            # Generic eye icon followed by number
-            'span:has(svg[viewBox*="24"])',
-            # Aria-label
-            '[aria-label*="view"]',
-            '[aria-label*="lượt xem"]',
-            '[aria-label*="lần xem"]',
-            # Text patterns near video
-            'div[role="article"] span:has-text("views")',
-            'div[role="article"] span:has-text("lượt xem")',
-            # Common FB classes (may change)
-            '[data-visualcompletion="ignore-dynamic"]',
-        ]
-        
-        for selector in selectors:
-            try:
-                elements = page.locator(selector).all()
-                for el in elements[:5]:
-                    text = el.text_content(timeout=1000)
-                    if text:
-                        # Look for number patterns
-                        match = re.search(r'(\d[\d.,]*[KkMmBb]?)', text)
-                        if match:
-                            value = parse_vietnamese_number(match.group(1))
-                            if 10 <= value <= 100000000:  # Sanity check
-                                candidate_views.append(value)
-                                attempts.append({'strategy': 'dom_selector', 'selector': selector[:30], 'text': text[:50], 'value': value})
-            except Exception as e:
-                pass
-    except Exception as e:
-        attempts.append({'strategy': 'dom_selector', 'error': str(e)[:100]})
-    
-    # === STRATEGY 3: JavaScript - search all text for "views" ===
+    # Strategy 2: JS DOM walker
     try:
         js_views = page.evaluate("""
             () => {
                 const results = [];
-                
-                // Get all text nodes
-                const walker = document.createTreeWalker(
-                    document.body,
-                    NodeFilter.SHOW_TEXT,
-                    null,
-                    false
-                );
-                
-                const viewKeywords = ['view', 'lượt xem', 'lần xem', 'lượt', 'lần'];
-                
-                let node;
-                while (node = walker.nextNode()) {
-                    const text = node.textContent || '';
-                    const parent = node.parentElement;
-                    if (!parent) continue;
-                    
-                    // Get full text including siblings
-                    const fullText = parent.textContent || '';
-                    
-                    // Check if contains view keyword
-                    const hasViewKeyword = viewKeywords.some(kw => 
-                        fullText.toLowerCase().includes(kw.toLowerCase())
-                    );
-                    
-                    if (hasViewKeyword) {
-                        // Extract number
-                        const numMatch = fullText.match(/(\\d[\\d.,]*\\s*[KkMmBb]?)/);
-                        if (numMatch) {
-                            results.push({
-                                text: fullText.substring(0, 100),
-                                number: numMatch[1]
-                            });
+                const spans = document.querySelectorAll('span');
+                for (const span of spans) {
+                    const text = (span.textContent || '').trim();
+                    if (/^[\\d.,]+\\s*[KkMmBb]?$/.test(text)) {
+                        const parent = span.parentElement;
+                        if (parent && parent.querySelector('svg')) {
+                            results.push({ text: text, hasIcon: true });
                         }
                     }
                 }
                 
-                // Also look for spans with eye icon SVG nearby
-                const spans = document.querySelectorAll('span');
-                for (const span of spans) {
-                    const text = span.textContent || '';
-                    // Match patterns like "1,5K" or "12.3K"
-                    if (/^[\\d.,]+\\s*[KkMmBb]?$/.test(text.trim())) {
-                        // Check if has SVG sibling (eye icon)
-                        const parent = span.parentElement;
-                        if (parent && parent.querySelector('svg')) {
-                            results.push({
-                                text: text.trim(),
-                                number: text.trim(),
-                                hasIcon: true
-                            });
-                        }
+                // Also search for "lượt xem" / "view" text
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT, null, false
+                );
+                let node;
+                while (node = walker.nextNode()) {
+                    const parent = node.parentElement;
+                    if (!parent) continue;
+                    const fullText = parent.textContent || '';
+                    if (/(view|lượt xem|lần xem)/i.test(fullText)) {
+                        const m = fullText.match(/([\\d.,]+\\s*[KkMmBb]?)/);
+                        if (m) results.push({ text: fullText.substring(0, 80), number: m[1] });
                     }
                 }
                 
@@ -398,11 +309,8 @@ def extract_views_multistrategy(page, html, debug_info):
         
         if js_views:
             for item in js_views[:10]:
-                num_str = item.get('number', '')
-                value = 0
-                # Need to import parse function in JS, or do here
+                num_str = item.get('number', item.get('text', ''))
                 try:
-                    # Simple parse
                     s = num_str.strip().replace(',', '.')
                     multiplier = 1
                     if s.lower().endswith('k'):
@@ -412,39 +320,32 @@ def extract_views_multistrategy(page, html, debug_info):
                         multiplier = 1000000
                         s = s[:-1]
                     value = int(float(s) * multiplier)
+                    if 10 <= value <= 100000000:
+                        candidate_views.append(value)
+                        attempts.append({
+                            'strategy': 'js_dom', 
+                            'text': item.get('text', '')[:50], 
+                            'value': value,
+                            'hasIcon': item.get('hasIcon', False)
+                        })
                 except:
                     pass
-                
-                if 10 <= value <= 100000000:
-                    candidate_views.append(value)
-                    attempts.append({
-                        'strategy': 'js_dom_search', 
-                        'text': item.get('text', '')[:50], 
-                        'value': value,
-                        'hasIcon': item.get('hasIcon', False)
-                    })
     except Exception as e:
-        attempts.append({'strategy': 'js_dom_search', 'error': str(e)[:100]})
+        attempts.append({'strategy': 'js_dom', 'error': str(e)[:100]})
     
     debug_info['view_extraction_attempts'] = attempts
     
-    # Return highest value found (FB may have multiple counters)
     if candidate_views:
-        # Filter for reasonable view counts
         valid_views = [v for v in candidate_views if 1 <= v <= 100000000]
         if valid_views:
-            # Take median to avoid outliers
             sorted_views = sorted(valid_views)
-            mid = sorted_views[len(sorted_views) // 2]
-            return mid
+            return sorted_views[len(sorted_views) // 2]
     
     return 0
 
 
 def extract_from_html(html):
-    """Extract non-view data from HTML"""
     data = {}
-    
     patterns = {
         'likes': [
             r'"reaction_count"[^}]*"count[":\s]*(\d+)',
@@ -467,7 +368,6 @@ def extract_from_html(html):
         'username': [
             r'"page_name[":\s]*"([^"]+)"',
             r'"profile_url[":\s]*"https://www\.facebook\.com/([^/"]+)"',
-            r'"actor_username[":\s]*"([^"]+)"',
         ],
         'caption': [
             r'"message[":\s]*\{[^}]*"text[":\s]*"([^"]+)"',
@@ -494,7 +394,6 @@ def extract_from_html(html):
                     if cleaned:
                         data[field] = cleaned[:500]
                         break
-    
     return data
 
 
@@ -503,8 +402,8 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '6.0-mobile-dom',
-        'engine': 'Playwright Mobile + DOM extraction',
+        'version': '6.1-cors',
+        'engine': 'Playwright Mobile + DOM extraction + CORS',
     })
 
 
@@ -528,7 +427,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '6.0-mobile-dom',
+        'version': '6.1-cors',
     })
 
 
