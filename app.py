@@ -1,11 +1,11 @@
 """
-Rise City Facebook Scraper API - V7.6 🎩
-Giữ nguyên views logic (V7.3 - work).
-Fix engagement bằng:
-1. Wait 15s + click video để trigger load
-2. Capture GraphQL network responses
-3. DOM walker với aria-label, title attributes
-4. Search innerText sau khi DOM render xong
+Rise City Facebook Scraper API - V7.7 🎩
+LAST ATTEMPT - Human simulation:
+1. Mouse movement (giả lập người thật)
+2. Random delays (không đều)
+3. Mobile m.facebook.com fallback nếu desktop fail
+4. Wait for selector (đợi engagement DOM load)
+5. Click vào reel để trigger full UI
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -14,6 +14,7 @@ import re
 import json
 import logging
 import time
+import random
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -127,14 +128,25 @@ def parse_vietnamese_number(text):
     return int(num)
 
 
-# Global cache for captured GraphQL responses
-captured_responses = []
+def simulate_human(page):
+    """Simulate human mouse/keyboard activity"""
+    try:
+        # Random mouse moves
+        for _ in range(3):
+            x = random.randint(100, 1200)
+            y = random.randint(100, 600)
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.3, 0.8))
+        
+        # Random scroll (smooth)
+        for offset in [200, 400, 600, 300]:
+            page.evaluate(f'window.scrollTo({{top: {offset}, behavior: "smooth"}})')
+            time.sleep(random.uniform(0.8, 1.5))
+    except Exception as e:
+        logger.warning(f'Human sim failed: {e}')
 
 
 def scrape_with_playwright(url):
-    global captured_responses
-    captured_responses = []
-    
     cookies = parse_netscape_cookies(COOKIES_PATH)
     if not cookies:
         return {'success': False, 'error': 'No cookies loaded'}
@@ -152,9 +164,11 @@ def scrape_with_playwright(url):
             'extracted_data': {},
             'view_extraction_attempts': [],
             'engagement_attempts': [],
-            'network_captures': 0,
-            'graphql_data_found': {},
+            'mode_used': '',
+            'innertext_length': 0,
+            'innertext_sample': '',
             'html_search_results': {},
+            'tried_modes': [],
         }
     }
     
@@ -169,126 +183,25 @@ def scrape_with_playwright(url):
                     '--disable-blink-features=AutomationControlled',
                     '--disable-gpu',
                     '--no-first-run',
+                    '--disable-infobars',
+                    '--window-size=1366,768',
                 ]
             )
             
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 1366, 'height': 768},
-                locale='vi-VN',
-                timezone_id='Asia/Ho_Chi_Minh',
-                extra_http_headers={
-                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                }
-            )
+            # === MODE 1: Desktop with full simulation ===
+            success = try_desktop_mode(browser, url, cookies, result)
             
-            context.add_cookies(cookies)
-            page = context.new_page()
+            if not success or (result['data']['likes'] == 0 and result['data']['comments'] == 0):
+                # === MODE 2: Mobile fallback ===
+                logger.info('Desktop mode insufficient, trying mobile')
+                try_mobile_mode(browser, url, cookies, result)
             
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
-            """)
-            
-            # Capture GraphQL responses
-            def handle_response(response):
-                try:
-                    url_lower = response.url.lower()
-                    if 'graphql' in url_lower or '/api/graphql' in url_lower:
-                        if response.status == 200:
-                            try:
-                                body = response.text()
-                                if body and len(body) < 5000000:  # 5MB limit
-                                    captured_responses.append(body)
-                            except:
-                                pass
-                except:
-                    pass
-            
-            page.on('response', handle_response)
-            
-            logger.info(f'Navigating to: {url}')
-            response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
-            
-            # Wait LONGER for engagement to load via GraphQL
-            time.sleep(10)
-            
-            # Trigger interaction to load engagement
-            try:
-                # Scroll to bottom of video to trigger load comment
-                page.evaluate('window.scrollTo(0, 600)')
-                time.sleep(3)
-                page.evaluate('window.scrollTo(0, 1200)')
-                time.sleep(3)
-                # Try clicking on video area to trigger more loads
-                page.evaluate('''
-                    const video = document.querySelector('video');
-                    if (video) video.click();
-                ''')
-                time.sleep(2)
-            except:
-                pass
-            
-            # Final wait
-            time.sleep(2)
-            
-            final_url = page.url
-            page_title = page.title()
-            result['debug']['final_url'] = final_url
-            result['debug']['page_title'] = page_title
-            result['debug']['response_status'] = response.status if response else None
-            result['debug']['network_captures'] = len(captured_responses)
-            
-            if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
-                result['error'] = 'Redirected to login - cookies invalid'
-                browser.close()
-                return result
-            
-            html = page.content()
-            result['debug']['html_length'] = len(html)
-            
-            # === VIEWS - V7.3 strategy (DON'T CHANGE) ===
-            html_views, view_attempts = search_views_in_html(html)
-            result['debug']['view_extraction_attempts'] = view_attempts
-            
-            # === ENGAGEMENT - try multiple sources ===
-            engagement = extract_engagement_multi_source(
-                page, html, captured_responses, result['debug']
-            )
-            
-            # Quick check
-            result['debug']['html_search_results'] = {
-                'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
-                'has_nguoi_khac': 'ng\u01b0\u1eddi kh\u00e1c' in html,
-                'has_binh_luan': 'b\u00ecnh lu\u1eadn' in html,
-                'has_luot_chia_se': 'l\u01b0\u1ee3t chia s\u1ebb' in html,
-            }
-            
-            # Username
-            dom_data = extract_username_from_dom(page)
-            
-            # Metadata
-            extracted = extract_metadata_from_html(html)
-            result['debug']['extracted_data'] = extracted
-            
-            result['data']['views'] = html_views
-            result['data']['likes'] = engagement.get('likes', 0)
-            result['data']['comments'] = engagement.get('comments', 0)
-            result['data']['shares'] = engagement.get('shares', 0)
-            result['data']['caption'] = decode_unicode_string(extracted.get('caption', ''))[:500]
-            result['data']['thumbnail'] = extracted.get('thumbnail', '')
-            result['data']['username'] = dom_data.get('username', '')
-            result['data']['post_id'] = extracted.get('post_id')
-            result['data']['video_url'] = final_url
+            browser.close()
             
             if (result['data']['views'] > 0 or 
                 result['data']['likes'] > 0 or
                 result['data']['caption']):
                 result['success'] = True
-            
-            browser.close()
     except Exception as e:
         logger.exception('Scrape failed')
         result['error'] = str(e)
@@ -297,8 +210,272 @@ def scrape_with_playwright(url):
     return result
 
 
+def try_desktop_mode(browser, url, cookies, result):
+    """Try desktop mode with human simulation"""
+    try:
+        result['debug']['tried_modes'].append('desktop')
+        
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1366, 'height': 768},
+            locale='vi-VN',
+            timezone_id='Asia/Ho_Chi_Minh',
+            extra_http_headers={
+                'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1',
+            }
+        )
+        
+        context.add_cookies(cookies)
+        page = context.new_page()
+        
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
+            window.chrome = { runtime: {} };
+        """)
+        
+        logger.info(f'Desktop mode navigating to: {url}')
+        response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
+        
+        # Initial wait
+        time.sleep(random.uniform(3, 5))
+        
+        # Simulate human
+        simulate_human(page)
+        
+        # Try wait for engagement element
+        try:
+            page.wait_for_selector('text=/(lượt xem|bình luận|người khác)/i', timeout=10000)
+            logger.info('Engagement text found via wait_for_selector')
+        except:
+            logger.info('wait_for_selector timeout')
+        
+        # Final wait
+        time.sleep(random.uniform(2, 4))
+        
+        final_url = page.url
+        page_title = page.title()
+        result['debug']['final_url'] = final_url
+        result['debug']['page_title'] = page_title
+        result['debug']['response_status'] = response.status if response else None
+        
+        if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
+            result['error'] = 'Redirected to login - cookies invalid'
+            context.close()
+            return False
+        
+        html = page.content()
+        result['debug']['html_length'] = len(html)
+        
+        # Capture innertext for debug
+        try:
+            innertext = page.evaluate('document.body.innerText || ""')
+            result['debug']['innertext_length'] = len(innertext)
+            result['debug']['innertext_sample'] = innertext[:500]
+        except:
+            pass
+        
+        # Views (V7.3 strategy)
+        html_views, view_attempts = search_views_in_html(html)
+        result['debug']['view_extraction_attempts'] = view_attempts
+        
+        # Engagement
+        engagement = extract_engagement_v77(page, html, result['debug'])
+        
+        # Metadata
+        extracted = extract_metadata_from_html(html)
+        result['debug']['extracted_data'] = extracted
+        
+        # Username
+        dom_data = extract_username_from_dom(page)
+        
+        result['debug']['html_search_results'] = {
+            'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
+            'has_nguoi_khac': 'ng\u01b0\u1eddi kh\u00e1c' in html,
+            'has_binh_luan': 'b\u00ecnh lu\u1eadn' in html,
+            'has_luot_chia_se': 'l\u01b0\u1ee3t chia s\u1ebb' in html,
+        }
+        
+        result['debug']['mode_used'] = 'desktop'
+        
+        # Set values
+        if html_views > 0:
+            result['data']['views'] = html_views
+        result['data']['likes'] = engagement.get('likes', 0)
+        result['data']['comments'] = engagement.get('comments', 0)
+        result['data']['shares'] = engagement.get('shares', 0)
+        result['data']['caption'] = decode_unicode_string(extracted.get('caption', ''))[:500]
+        result['data']['thumbnail'] = extracted.get('thumbnail', '')
+        result['data']['username'] = dom_data.get('username', '')
+        result['data']['post_id'] = extracted.get('post_id')
+        result['data']['video_url'] = final_url
+        
+        context.close()
+        return True
+    except Exception as e:
+        logger.warning(f'Desktop mode failed: {e}')
+        return False
+
+
+def try_mobile_mode(browser, url, cookies, result):
+    """Try mobile m.facebook.com mode"""
+    try:
+        result['debug']['tried_modes'].append('mobile')
+        
+        # Convert URL to m.facebook.com if possible
+        mobile_url = url.replace('www.facebook.com', 'm.facebook.com')
+        if 'm.facebook.com' not in mobile_url:
+            mobile_url = mobile_url.replace('facebook.com', 'm.facebook.com')
+        
+        # Adjust cookies domain
+        mobile_cookies = []
+        for c in cookies:
+            new_c = dict(c)
+            if c['domain'] == '.facebook.com' or c['domain'] == 'facebook.com':
+                new_c['domain'] = '.facebook.com'  # works for both
+            mobile_cookies.append(new_c)
+        
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
+            viewport={'width': 414, 'height': 896},
+            locale='vi-VN',
+            timezone_id='Asia/Ho_Chi_Minh',
+            extra_http_headers={
+                'Accept-Language': 'vi-VN,vi;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            }
+        )
+        
+        context.add_cookies(mobile_cookies)
+        page = context.new_page()
+        
+        logger.info(f'Mobile mode navigating to: {mobile_url}')
+        response = page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
+        
+        time.sleep(random.uniform(5, 8))
+        
+        # Scroll on mobile
+        for offset in [200, 400, 600]:
+            try:
+                page.evaluate(f'window.scrollTo(0, {offset})')
+                time.sleep(random.uniform(1, 2))
+            except:
+                pass
+        
+        time.sleep(2)
+        
+        html = page.content()
+        
+        # Try to extract from mobile HTML
+        mobile_engagement = extract_engagement_mobile(html, page, result['debug'])
+        
+        # Update result if mobile found better data
+        if mobile_engagement.get('likes', 0) > result['data']['likes']:
+            result['data']['likes'] = mobile_engagement['likes']
+            result['debug']['mode_used'] = 'desktop+mobile'
+        if mobile_engagement.get('comments', 0) > result['data']['comments']:
+            result['data']['comments'] = mobile_engagement['comments']
+        if mobile_engagement.get('shares', 0) > result['data']['shares']:
+            result['data']['shares'] = mobile_engagement['shares']
+        
+        # Mobile innertext
+        try:
+            mobile_innertext = page.evaluate('document.body.innerText || ""')
+            result['debug']['mobile_innertext_length'] = len(mobile_innertext)
+            result['debug']['mobile_innertext_sample'] = mobile_innertext[:500]
+        except:
+            pass
+        
+        context.close()
+    except Exception as e:
+        logger.warning(f'Mobile mode failed: {e}')
+
+
+def extract_engagement_mobile(html, page, debug_info):
+    """Extract engagement from m.facebook.com (often has plain text)"""
+    data = {}
+    attempts = []
+    
+    # Try DOM innerText first
+    try:
+        innertext = page.evaluate('document.body.innerText || ""')
+        debug_info['mobile_innertext_sample'] = innertext[:1000]
+        
+        # Mobile may have different format: "63 người", "3 bình luận"
+        text_to_search = innertext + '\n' + html
+        
+        # Likes
+        like_patterns = [
+            r'v\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*kh\u00e1c',
+            r'([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*\u0111\u00e3\s*th\u00edch',
+            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*th\u00edch',
+            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*reactions?',
+        ]
+        like_candidates = []
+        for pat in like_patterns:
+            matches = re.findall(pat, text_to_search, re.IGNORECASE)
+            for m in matches[:10]:
+                value = parse_vietnamese_number(m)
+                if 1 <= value <= 100000000:
+                    if 'kh\u00e1c' in pat:
+                        like_candidates.append(value + 1)
+                    else:
+                        like_candidates.append(value)
+                    attempts.append({'type': 'like', 'match': m, 'pattern': pat[:30]})
+        if like_candidates:
+            data['likes'] = max(like_candidates)
+        
+        # Comments
+        comment_patterns = [
+            r'([\d.,]+\s*[KkMmBb]?)\s*b\u00ecnh\s*lu\u1eadn',
+            r'([\d.,]+\s*[KkMmBb]?)\s*comments?',
+        ]
+        comment_candidates = []
+        for pat in comment_patterns:
+            matches = re.findall(pat, text_to_search, re.IGNORECASE)
+            for m in matches[:10]:
+                value = parse_vietnamese_number(m)
+                if 0 <= value <= 100000000:
+                    comment_candidates.append(value)
+                    attempts.append({'type': 'comment', 'match': m, 'pattern': pat[:30]})
+        if comment_candidates:
+            from collections import Counter
+            counter = Counter(comment_candidates)
+            data['comments'] = counter.most_common(1)[0][0]
+        
+        # Shares
+        share_patterns = [
+            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*chia\s*s\u1ebb',
+            r'([\d.,]+\s*[KkMmBb]?)\s*shares?',
+        ]
+        share_candidates = []
+        for pat in share_patterns:
+            matches = re.findall(pat, text_to_search, re.IGNORECASE)
+            for m in matches[:10]:
+                value = parse_vietnamese_number(m)
+                if 1 <= value <= 100000000:
+                    share_candidates.append(value)
+                    attempts.append({'type': 'share', 'match': m, 'pattern': pat[:30]})
+        if share_candidates:
+            from collections import Counter
+            counter = Counter(share_candidates)
+            data['shares'] = counter.most_common(1)[0][0]
+    except Exception as e:
+        attempts.append({'error': str(e)[:100]})
+    
+    debug_info['mobile_engagement_attempts'] = attempts[:10]
+    return data
+
+
 def search_views_in_html(html):
-    """V7.3 strategy - DON'T CHANGE - works perfectly"""
+    """V7.3 strategy - works for views"""
     view_candidates = []
     view_attempts = []
     
@@ -320,190 +497,106 @@ def search_views_in_html(html):
     return final_views, view_attempts
 
 
-def extract_engagement_multi_source(page, html, network_responses, debug_info):
-    """
-    Try MULTIPLE sources to find engagement:
-    1. Network captured GraphQL responses
-    2. DOM with aria-label/title (after JS render)
-    3. innerText after wait
-    4. HTML search (fallback)
-    """
+def extract_engagement_v77(page, html, debug_info):
+    """Extract engagement from desktop page"""
     data = {'likes': 0, 'comments': 0, 'shares': 0}
     attempts = []
-    graphql_found = {}
     
-    # === SOURCE 1: GraphQL captured responses ===
-    for resp_body in network_responses:
-        try:
-            # Try parse as JSON or find JSON-like patterns
-            
-            # Reaction count
-            for pat in [
-                r'"reaction_count"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
-                r'"likers"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
-                r'"reactors"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
-                r'"top_reactions"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
-            ]:
-                m = re.search(pat, resp_body)
-                if m:
-                    val = int(m.group(1))
-                    if val > data['likes']:
-                        data['likes'] = val
-                        graphql_found['likes_pattern'] = pat[:40]
-                        graphql_found['likes_value'] = val
-                        break
-            
-            # Comments
-            for pat in [
-                r'"total_comment_count"\s*:\s*(\d+)',
-                r'"comment_count"\s*:\s*\{[^}]*"total_count"\s*:\s*(\d+)',
-                r'"comments"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
-            ]:
-                m = re.search(pat, resp_body)
-                if m:
-                    val = int(m.group(1))
-                    if val > data['comments']:
-                        data['comments'] = val
-                        graphql_found['comments_pattern'] = pat[:40]
-                        graphql_found['comments_value'] = val
-                        break
-            
-            # Shares
-            for pat in [
-                r'"share_count"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
-                r'"reshare_count"\s*:\s*(\d+)',
-                r'"share_count"\s*:\s*(\d+)',
-            ]:
-                m = re.search(pat, resp_body)
-                if m:
-                    val = int(m.group(1))
-                    if val > data['shares']:
-                        data['shares'] = val
-                        graphql_found['shares_pattern'] = pat[:40]
-                        graphql_found['shares_value'] = val
-                        break
-        except:
-            continue
-    
-    debug_info['graphql_data_found'] = graphql_found
-    
-    # === SOURCE 2: DOM with aria-label / title attributes ===
-    if data['likes'] == 0 or data['comments'] == 0 or data['shares'] == 0:
-        try:
-            dom_results = page.evaluate("""
-                () => {
-                    const result = {
-                        ariaLabels: [],
-                        titles: [],
-                        innerText: ''
-                    };
-                    
-                    // Get all aria-labels and titles that contain numbers
-                    document.querySelectorAll('[aria-label]').forEach(el => {
-                        const label = el.getAttribute('aria-label') || '';
-                        if (/\\d/.test(label) && label.length < 200) {
-                            result.ariaLabels.push(label);
-                        }
-                    });
-                    
-                    document.querySelectorAll('[title]').forEach(el => {
-                        const title = el.getAttribute('title') || '';
-                        if (/\\d/.test(title) && title.length < 200) {
-                            result.titles.push(title);
-                        }
-                    });
-                    
-                    // Get full innerText
-                    result.innerText = document.body.innerText || '';
-                    
-                    return result;
-                }
-            """)
-            
-            # Combine all text sources
-            all_text_sources = []
-            if dom_results.get('ariaLabels'):
-                all_text_sources.extend(dom_results['ariaLabels'])
-            if dom_results.get('titles'):
-                all_text_sources.extend(dom_results['titles'])
-            if dom_results.get('innerText'):
-                all_text_sources.append(dom_results['innerText'])
-            
-            combined_text = '\n'.join(all_text_sources)
-            
-            # Search for likes pattern
-            if data['likes'] == 0:
-                like_patterns = [
-                    r'v\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*kh\u00e1c',
-                    r'and\s*([\d.,]+\s*[KkMmBb]?)\s*others?',
-                    r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*th\u00edch',
-                    r'([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*\u0111\u00e3\s*th\u00edch',
-                    r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*reactions?',
-                ]
-                like_candidates = []
-                for pat in like_patterns:
-                    matches = re.findall(pat, combined_text, re.IGNORECASE)
-                    for m in matches[:10]:
-                        value = parse_vietnamese_number(m)
-                        if 1 <= value <= 100000000:
-                            # +1 if it's "and X others" pattern
-                            if 'kh\u00e1c' in pat or 'other' in pat:
-                                like_candidates.append(value + 1)
-                            else:
-                                like_candidates.append(value)
-                            attempts.append({'type': 'like', 'match': m, 'pattern': pat[:30]})
-                if like_candidates:
-                    data['likes'] = max(like_candidates)
-            
-            # Search for comments pattern
-            if data['comments'] == 0:
-                comment_patterns = [
-                    r'([\d.,]+\s*[KkMmBb]?)\s*b\u00ecnh\s*lu\u1eadn',
-                    r'([\d.,]+\s*[KkMmBb]?)\s*comments?',
-                ]
-                comment_candidates = []
-                for pat in comment_patterns:
-                    matches = re.findall(pat, combined_text, re.IGNORECASE)
-                    for m in matches[:10]:
-                        value = parse_vietnamese_number(m)
-                        if 0 <= value <= 100000000:
-                            comment_candidates.append(value)
-                            attempts.append({'type': 'comment', 'match': m, 'pattern': pat[:30]})
-                if comment_candidates:
-                    # Take most common
-                    from collections import Counter
-                    counter = Counter(comment_candidates)
-                    data['comments'] = counter.most_common(1)[0][0]
-            
-            # Search for shares pattern
-            if data['shares'] == 0:
-                share_patterns = [
-                    r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*chia\s*s\u1ebb',
-                    r'([\d.,]+\s*[KkMmBb]?)\s*shares?',
-                ]
-                share_candidates = []
-                for pat in share_patterns:
-                    matches = re.findall(pat, combined_text, re.IGNORECASE)
-                    for m in matches[:10]:
-                        value = parse_vietnamese_number(m)
-                        if 1 <= value <= 100000000:
-                            share_candidates.append(value)
-                            attempts.append({'type': 'share', 'match': m, 'pattern': pat[:30]})
-                if share_candidates:
-                    from collections import Counter
-                    counter = Counter(share_candidates)
-                    data['shares'] = counter.most_common(1)[0][0]
-            
-            debug_info['dom_text_samples'] = {
-                'aria_labels_count': len(dom_results.get('ariaLabels', [])),
-                'titles_count': len(dom_results.get('titles', [])),
-                'innertext_length': len(dom_results.get('innerText', '')),
-                'first_3_aria_labels': dom_results.get('ariaLabels', [])[:3],
+    try:
+        # Get DOM text + aria-labels combined
+        dom_results = page.evaluate("""
+            () => {
+                const result = {ariaLabels: [], titles: [], innerText: ''};
+                document.querySelectorAll('[aria-label]').forEach(el => {
+                    const label = el.getAttribute('aria-label') || '';
+                    if (/\\d/.test(label) && label.length < 200) {
+                        result.ariaLabels.push(label);
+                    }
+                });
+                document.querySelectorAll('[title]').forEach(el => {
+                    const title = el.getAttribute('title') || '';
+                    if (/\\d/.test(title) && title.length < 200) {
+                        result.titles.push(title);
+                    }
+                });
+                result.innerText = document.body.innerText || '';
+                return result;
             }
-        except Exception as e:
-            attempts.append({'error': str(e)[:100]})
+        """)
+        
+        all_text = '\n'.join([
+            *(dom_results.get('ariaLabels') or []),
+            *(dom_results.get('titles') or []),
+            dom_results.get('innerText', ''),
+            html,  # last resort
+        ])
+        
+        # Likes
+        like_patterns = [
+            r'v\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*kh\u00e1c',
+            r'and\s*([\d.,]+\s*[KkMmBb]?)\s*others?',
+            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*th\u00edch',
+            r'([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*\u0111\u00e3\s*th\u00edch',
+        ]
+        like_candidates = []
+        for pat in like_patterns:
+            matches = re.findall(pat, all_text, re.IGNORECASE)
+            for m in matches[:10]:
+                value = parse_vietnamese_number(m)
+                if 1 <= value <= 100000000:
+                    if 'kh\u00e1c' in pat or 'other' in pat:
+                        like_candidates.append(value + 1)
+                    else:
+                        like_candidates.append(value)
+                    attempts.append({'type': 'like', 'match': m})
+        if like_candidates:
+            data['likes'] = max(like_candidates)
+        
+        # Comments
+        comment_patterns = [
+            r'([\d.,]+\s*[KkMmBb]?)\s*b\u00ecnh\s*lu\u1eadn',
+            r'([\d.,]+\s*[KkMmBb]?)\s*comments?',
+        ]
+        comment_candidates = []
+        for pat in comment_patterns:
+            matches = re.findall(pat, all_text, re.IGNORECASE)
+            for m in matches[:10]:
+                value = parse_vietnamese_number(m)
+                if 0 <= value <= 100000000:
+                    comment_candidates.append(value)
+                    attempts.append({'type': 'comment', 'match': m})
+        if comment_candidates:
+            from collections import Counter
+            counter = Counter(comment_candidates)
+            data['comments'] = counter.most_common(1)[0][0]
+        
+        # Shares
+        share_patterns = [
+            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*chia\s*s\u1ebb',
+            r'([\d.,]+\s*[KkMmBb]?)\s*shares?',
+        ]
+        share_candidates = []
+        for pat in share_patterns:
+            matches = re.findall(pat, all_text, re.IGNORECASE)
+            for m in matches[:10]:
+                value = parse_vietnamese_number(m)
+                if 1 <= value <= 100000000:
+                    share_candidates.append(value)
+                    attempts.append({'type': 'share', 'match': m})
+        if share_candidates:
+            from collections import Counter
+            counter = Counter(share_candidates)
+            data['shares'] = counter.most_common(1)[0][0]
+        
+        debug_info['dom_text_samples'] = {
+            'aria_labels_count': len(dom_results.get('ariaLabels', [])),
+            'titles_count': len(dom_results.get('titles', [])),
+            'innertext_length': len(dom_results.get('innerText', '')),
+        }
+    except Exception as e:
+        attempts.append({'error': str(e)[:100]})
     
-    debug_info['engagement_attempts'] = attempts[:15]
+    debug_info['engagement_attempts'] = attempts[:10]
     return data
 
 
@@ -520,10 +613,7 @@ def extract_username_from_dom(page):
                     if (match) {
                         const text = (link.textContent || '').trim();
                         if (text && text.length > 1 && text.length < 100) {
-                            results.push({
-                                username: match[1],
-                                displayName: text
-                            });
+                            results.push({username: match[1], displayName: text});
                         }
                     }
                 }
@@ -577,7 +667,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '7.6-network-capture',
+        'version': '7.7-human-sim',
     })
 
 
@@ -601,7 +691,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '7.6-network-capture',
+        'version': '7.7-human-sim',
     })
 
 
