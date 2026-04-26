@@ -1,16 +1,14 @@
 """
-Rise City Facebook Scraper API 🎩 - V2
-Cải tiến: 
-- Auto-resolve shortened URL (/share/r/, /share/v/, fb.watch)
-- Try nhiều URL formats
-- Better error logging
+Rise City Facebook Scraper API - V3 với Playwright 🎩
+Sử dụng Chromium + cookies để giả lập browser thật scrape Facebook
 """
 from flask import Flask, request, jsonify
-from facebook_scraper import get_posts
+from playwright.sync_api import sync_playwright
 import os
 import re
+import json
 import logging
-import requests
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,98 +19,255 @@ COOKIES_PATH = os.getenv('FB_COOKIES_PATH', '/etc/secrets/cookies.txt')
 API_SECRET = os.getenv('API_SECRET', 'rise-city-secret-2026')
 
 
-def resolve_facebook_url(url):
-    """
-    Resolve shortened FB URL to full URL.
-    Examples:
-    - https://www.facebook.com/share/r/XXXX/ -> https://www.facebook.com/reel/123456
-    - https://fb.watch/XXXX/ -> https://www.facebook.com/...
-    """
+def parse_netscape_cookies(cookies_path):
+    """Parse Netscape cookies.txt to Playwright format"""
+    cookies = []
+    if not os.path.exists(cookies_path):
+        return cookies
+    
+    with open(cookies_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split('\t')
+            if len(parts) < 7:
+                continue
+            
+            domain, flag, path, secure, expiration, name, value = parts[:7]
+            cookies.append({
+                'name': name,
+                'value': value,
+                'domain': domain,
+                'path': path,
+                'secure': secure.upper() == 'TRUE',
+                'httpOnly': False,
+                'sameSite': 'Lax',
+            })
+    return cookies
+
+
+def parse_count(text):
+    """Parse '1.2K', '5M', '1,234' to integer"""
+    if not text:
+        return 0
+    text = str(text).strip().replace(',', '').replace('.', '')
+    
+    # Vietnamese number parsing (period as thousand separator)
+    text_clean = re.sub(r'[^\d.,KMBkmbtr]', '', text)
+    
+    multipliers = {'K': 1000, 'M': 1000000, 'B': 1000000000, 'tr': 1000000, 'k': 1000}
+    
+    for suffix, mult in multipliers.items():
+        if suffix in text_clean:
+            num_str = text_clean.replace(suffix, '')
+            try:
+                return int(float(num_str) * mult)
+            except:
+                continue
+    
     try:
-        # Load cookies for redirect tracking
-        cookies = {}
-        if os.path.exists(COOKIES_PATH):
-            with open(COOKIES_PATH, 'r') as f:
-                for line in f:
-                    if line.startswith('#') or not line.strip():
-                        continue
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 7:
-                        cookies[parts[5]] = parts[6]
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+        return int(re.sub(r'[^\d]', '', text_clean) or 0)
+    except:
+        return 0
+
+
+def scrape_with_playwright(url):
+    """Scrape Facebook video using Playwright + cookies"""
+    
+    cookies = parse_netscape_cookies(COOKIES_PATH)
+    if not cookies:
+        return {'error': 'No cookies loaded'}
+    
+    result = {
+        'success': False,
+        'data': {
+            'views': 0, 'likes': 0, 'comments': 0, 'shares': 0,
+            'caption': '', 'thumbnail': '', 'username': '', 'post_id': None
+        },
+        'debug': {
+            'final_url': '',
+            'page_title': '',
+            'extracted_data': {},
         }
-        
-        # Follow redirects
-        response = requests.get(url, headers=headers, cookies=cookies, allow_redirects=True, timeout=15)
-        final_url = response.url
-        logger.info(f'Resolved {url} -> {final_url}')
-        return final_url
+    }
+    
+    try:
+        with sync_playwright() as p:
+            # Launch with minimal memory footprint
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-extensions',
+                    '--no-first-run',
+                    '--disable-blink-features=AutomationControlled',
+                    '--single-process',  # Save memory
+                    '--no-zygote',
+                ]
+            )
+            
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1280, 'height': 720},
+                locale='vi-VN',
+            )
+            
+            # Inject cookies
+            context.add_cookies(cookies)
+            logger.info(f'Injected {len(cookies)} cookies')
+            
+            page = context.new_page()
+            
+            # Block unnecessary resources to save memory
+            page.route('**/*', lambda route: route.abort() 
+                      if route.request.resource_type in ['image', 'media', 'font', 'stylesheet']
+                      else route.continue_())
+            
+            # Navigate
+            logger.info(f'Navigating to: {url}')
+            page.goto(url, wait_until='domcontentloaded', timeout=60000)
+            
+            # Wait for content to load
+            time.sleep(5)
+            
+            final_url = page.url
+            page_title = page.title()
+            result['debug']['final_url'] = final_url
+            result['debug']['page_title'] = page_title
+            
+            logger.info(f'Final URL: {final_url}')
+            logger.info(f'Page title: {page_title}')
+            
+            # Try to get HTML and extract data
+            html = page.content()
+            
+            # Extract from HTML using regex (FB embeds data in JSON)
+            extracted = extract_from_html(html)
+            result['debug']['extracted_data'] = extracted
+            
+            # Try to get visible counts from DOM
+            dom_data = extract_from_dom(page)
+            
+            # Merge: prefer DOM data if available, fallback to HTML
+            result['data']['views'] = dom_data.get('views') or extracted.get('views', 0)
+            result['data']['likes'] = dom_data.get('likes') or extracted.get('likes', 0)
+            result['data']['comments'] = dom_data.get('comments') or extracted.get('comments', 0)
+            result['data']['shares'] = dom_data.get('shares') or extracted.get('shares', 0)
+            result['data']['caption'] = dom_data.get('caption') or extracted.get('caption', '')[:500]
+            result['data']['thumbnail'] = extracted.get('thumbnail', '')
+            result['data']['username'] = extracted.get('username', '')
+            result['data']['post_id'] = extracted.get('post_id')
+            
+            if (result['data']['views'] > 0 or result['data']['likes'] > 0 or
+                result['data']['caption']):
+                result['success'] = True
+            
+            browser.close()
     except Exception as e:
-        logger.error(f'URL resolve failed: {e}')
-        return url
+        logger.exception('Playwright scrape failed')
+        result['error'] = str(e)
+        result['error_type'] = type(e).__name__
+    
+    return result
 
 
-def extract_video_id_from_html(url):
-    """Try to extract video_id from FB page HTML"""
-    try:
-        cookies = {}
-        if os.path.exists(COOKIES_PATH):
-            with open(COOKIES_PATH, 'r') as f:
-                for line in f:
-                    if line.startswith('#') or not line.strip():
-                        continue
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 7:
-                        cookies[parts[5]] = parts[6]
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        }
-        response = requests.get(url, headers=headers, cookies=cookies, allow_redirects=True, timeout=15)
-        html = response.text
-        
-        # Look for video_id patterns in HTML
-        patterns = [
-            r'"video_id":"(\d+)"',
-            r'"videoID":"(\d+)"',
-            r'/reel/(\d+)',
-            r'/videos/(\d+)',
-            r'story_fbid=(\d+)',
-            r'"top_level_post_id":"(\d+)"',
+def extract_from_html(html):
+    """Extract data from HTML using regex patterns"""
+    data = {}
+    
+    # Patterns for various FB data
+    patterns = {
+        'views': [
+            r'"video_view_count[":\s]*(\d+)',
+            r'"video_view_count_renderer"[^}]*"count[":\s]*(\d+)',
+            r'"play_count[":\s]*(\d+)',
+            r'"viewCount[":\s]*(\d+)',
+        ],
+        'likes': [
+            r'"reaction_count"[^}]*"count[":\s]*(\d+)',
+            r'"top_reactions"[^}]*"count[":\s]*(\d+)',
+            r'"likes_count[":\s]*(\d+)',
+        ],
+        'comments': [
+            r'"total_comment_count[":\s]*(\d+)',
+            r'"comment_count"[^}]*"total_count[":\s]*(\d+)',
+        ],
+        'shares': [
+            r'"share_count"[^}]*"count[":\s]*(\d+)',
+            r'"share_count_reduced[":\s]*"([^"]+)"',
+        ],
+        'post_id': [
+            r'"top_level_post_id[":\s]*"(\d+)"',
+            r'"video_id[":\s]*"(\d+)"',
+        ],
+        'username': [
+            r'"page_name[":\s]*"([^"]+)"',
+            r'"author_username[":\s]*"([^"]+)"',
+        ],
+        'caption': [
+            r'"message[":\s]*\{[^}]*"text[":\s]*"([^"]+)"',
+            r'<meta\s+property="og:description"\s+content="([^"]+)"',
+        ],
+        'thumbnail': [
+            r'<meta\s+property="og:image"\s+content="([^"]+)"',
+            r'"first_frame_thumbnail[":\s]*"([^"]+)"',
         ]
-        for pattern in patterns:
-            match = re.search(pattern, html)
+    }
+    
+    for field, pats in patterns.items():
+        for pat in pats:
+            match = re.search(pat, html)
             if match:
-                vid = match.group(1)
-                logger.info(f'Found video ID from HTML: {vid}')
-                return vid
+                value = match.group(1)
+                if field in ['views', 'likes', 'comments', 'shares']:
+                    data[field] = parse_count(value)
+                else:
+                    data[field] = value.replace('\\u003C', '<').replace('\\/', '/')[:500]
+                break
+    
+    return data
+
+
+def extract_from_dom(page):
+    """Extract visible counts from DOM"""
+    data = {}
+    
+    try:
+        # Get caption from meta or visible text
+        try:
+            desc = page.locator('meta[property="og:description"]').get_attribute('content', timeout=2000)
+            if desc:
+                data['caption'] = desc[:500]
+        except:
+            pass
         
-        return None
+        # Try to find view count in visible text
+        try:
+            # Vietnamese: "lượt xem", English: "views"
+            view_patterns = [
+                'text=/\\d[\\d.,]*[KkMmBb]?\\s*(views?|lượt xem|lần xem)/i',
+            ]
+            for pattern in view_patterns:
+                elements = page.locator(pattern).all()
+                for el in elements[:3]:
+                    text = el.text_content()
+                    if text:
+                        match = re.search(r'(\d[\d.,]*[KkMmBb]?)', text)
+                        if match:
+                            data['views'] = parse_count(match.group(1))
+                            break
+                if data.get('views'):
+                    break
+        except:
+            pass
     except Exception as e:
-        logger.error(f'Extract video ID from HTML failed: {e}')
-        return None
-
-
-def extract_post_id(url):
-    """Extract post ID from various Facebook URL formats"""
-    patterns = [
-        r'/reel/(\d+)',
-        r'/videos/(\d+)',
-        r'/posts/(\d+)',
-        r'fbid=(\d+)',
-        r'story_fbid=(\d+)',
-        r'/permalink/(\d+)',
-        r'/share/[rvp]/([^/?]+)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
+        logger.warning(f'DOM extract failed: {e}')
+    
+    return data
 
 
 @app.route('/', methods=['GET'])
@@ -120,57 +275,26 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '2.0',
-        'message': 'Niệm Bụt 3 lần để scrape Facebook!',
-        'endpoints': {
-            '/scrape': 'POST - Scrape video stats (cần API key)',
-            '/health': 'GET - Health check',
-            '/resolve': 'POST - Test URL resolver',
-        }
+        'version': '3.0-playwright',
+        'engine': 'Playwright + Chromium',
     })
 
 
 @app.route('/health', methods=['GET'])
 def health():
     cookies_exist = os.path.exists(COOKIES_PATH)
+    cookies_count = len(parse_netscape_cookies(COOKIES_PATH)) if cookies_exist else 0
+    
     return jsonify({
         'status': 'ok',
         'cookies_loaded': cookies_exist,
-        'cookies_path': COOKIES_PATH if cookies_exist else 'NOT FOUND',
-        'version': '2.0'
-    })
-
-
-@app.route('/resolve', methods=['POST'])
-def resolve_url_endpoint():
-    """Test endpoint to resolve URL"""
-    api_key = request.headers.get('X-API-Key') or request.headers.get('x-api-key')
-    if api_key != API_SECRET:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.get_json(silent=True) or {}
-    url = data.get('url', '')
-    if not url:
-        return jsonify({'error': 'Missing url'}), 400
-    
-    resolved = resolve_facebook_url(url)
-    video_id = extract_video_id_from_html(url)
-    post_id_from_url = extract_post_id(url)
-    post_id_from_resolved = extract_post_id(resolved)
-    
-    return jsonify({
-        'original_url': url,
-        'resolved_url': resolved,
-        'post_id_from_url': post_id_from_url,
-        'post_id_from_resolved': post_id_from_resolved,
-        'video_id_from_html': video_id,
+        'cookies_count': cookies_count,
+        'version': '3.0-playwright',
     })
 
 
 @app.route('/scrape', methods=['POST'])
-def scrape_video():
-    """Scrape Facebook video stats"""
-    
+def scrape_endpoint():
     api_key = request.headers.get('X-API-Key') or request.headers.get('x-api-key')
     if api_key != API_SECRET:
         return jsonify({'error': 'Unauthorized'}), 401
@@ -179,139 +303,11 @@ def scrape_video():
     url = data.get('url', '')
     
     if not url:
-        return jsonify({'error': 'Missing url parameter'}), 400
+        return jsonify({'error': 'Missing url'}), 400
     
-    logger.info(f'Scraping: {url}')
-    
-    if not os.path.exists(COOKIES_PATH):
-        return jsonify({
-            'error': 'Cookies file not found',
-            'message': 'Server chưa được cấu hình đúng.'
-        }), 500
-    
-    # Step 1: Resolve URL if shortened
-    is_shortened = '/share/' in url or 'fb.watch' in url
-    resolved_url = url
-    
-    if is_shortened:
-        resolved_url = resolve_facebook_url(url)
-        logger.info(f'Resolved URL: {resolved_url}')
-    
-    # Step 2: Get post/video ID
-    post_id = extract_post_id(resolved_url) or extract_post_id(url)
-    
-    # Step 3: If still no ID, try extracting from HTML
-    if not post_id:
-        post_id = extract_video_id_from_html(url)
-    
-    logger.info(f'Final post_id: {post_id}')
-    
-    # Step 4: Try multiple URL formats with facebook-scraper
-    try_urls = []
-    
-    # Add original and resolved
-    try_urls.append(resolved_url)
-    if url != resolved_url:
-        try_urls.append(url)
-    
-    # Add post_id-based URLs
-    if post_id:
-        try_urls.append(post_id)
-        try_urls.append(f'https://www.facebook.com/{post_id}')
-        try_urls.append(f'https://www.facebook.com/reel/{post_id}')
-        try_urls.append(f'https://www.facebook.com/watch/?v={post_id}')
-    
-    debug_attempts = []
-    posts = []
-    
-    for try_url in try_urls:
-        try:
-            logger.info(f'Trying URL: {try_url}')
-            results = list(get_posts(
-                post_urls=[try_url],
-                cookies=COOKIES_PATH,
-                options={
-                    'reactors': False,
-                    'comments': False,
-                    'progress': False,
-                    'allow_extra_requests': True,
-                }
-            ))
-            
-            if results and len(results) > 0:
-                post = results[0]
-                # Check if we got real data (not empty)
-                has_data = (
-                    post.get('post_id') or 
-                    post.get('text') or 
-                    post.get('video_watches') or 
-                    post.get('likes') or
-                    post.get('reactions')
-                )
-                
-                debug_attempts.append({
-                    'url': try_url,
-                    'success': True,
-                    'has_data': bool(has_data),
-                    'fields_found': [k for k, v in post.items() if v is not None and v != '' and v != 0]
-                })
-                
-                if has_data:
-                    posts = results
-                    logger.info(f'SUCCESS with URL: {try_url}')
-                    break
-            else:
-                debug_attempts.append({'url': try_url, 'success': False, 'message': 'Empty result'})
-        except Exception as e:
-            debug_attempts.append({'url': try_url, 'success': False, 'error': str(e)})
-            logger.warning(f'Failed with {try_url}: {e}')
-            continue
-    
-    if not posts:
-        return jsonify({
-            'success': False,
-            'error': 'No data found',
-            'message': 'facebook-scraper không lấy được data từ link này',
-            'debug': {
-                'original_url': url,
-                'resolved_url': resolved_url,
-                'extracted_post_id': post_id,
-                'attempts': debug_attempts
-            }
-        }), 200  # Return 200 with success=false for easier debugging
-    
-    post = posts[0]
-    
-    # Sum reactions
-    reactions = post.get('reactions') or {}
-    total_likes = 0
-    if reactions:
-        total_likes = sum(v for v in reactions.values() if isinstance(v, int))
-    if total_likes == 0:
-        total_likes = post.get('likes') or 0
-    
-    return jsonify({
-        'success': True,
-        'data': {
-            'views': post.get('video_watches') or 0,
-            'likes': total_likes,
-            'comments': post.get('comments') or 0,
-            'shares': post.get('shares') or 0,
-            'caption': (post.get('text') or post.get('post_text') or '')[:500],
-            'thumbnail': post.get('image') or post.get('video_thumbnail') or '',
-            'reactions_breakdown': reactions,
-            'post_id': post.get('post_id'),
-            'username': post.get('username'),
-            'time': str(post.get('time')) if post.get('time') else None,
-            'video_url': post.get('video') or '',
-            'is_live': post.get('is_live', False),
-        },
-        'debug': {
-            'resolved_url': resolved_url,
-            'post_id_used': post_id,
-            'attempts_count': len(debug_attempts)
-        }
-    })
+    logger.info(f'Scraping with Playwright: {url}')
+    result = scrape_with_playwright(url)
+    return jsonify(result)
 
 
 if __name__ == '__main__':
