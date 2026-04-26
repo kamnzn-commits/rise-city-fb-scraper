@@ -1,15 +1,13 @@
-# Render configuration
 services:
   - type: web
     name: rise-city-fb-scraper
     runtime: python
     plan: free
     region: singapore
+    pythonVersion: "3.10"
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 180 app:app
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.10.13
       - key: API_SECRET
         generateValue: true
       - key: FB_COOKIES_PATH
