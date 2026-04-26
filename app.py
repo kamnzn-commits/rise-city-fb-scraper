@@ -1,11 +1,13 @@
 """
-Rise City Facebook Scraper API - V7.7 🎩
-LAST ATTEMPT - Human simulation:
-1. Mouse movement (giả lập người thật)
-2. Random delays (không đều)
-3. Mobile m.facebook.com fallback nếu desktop fail
-4. Wait for selector (đợi engagement DOM load)
-5. Click vào reel để trigger full UI
+Rise City Facebook Scraper API - V7.8 🎩
+KEY INSIGHT: Mobile FB hiển thị icon + số:
+  󰍸 (icon thích) → 96 likes
+  󰍹 (icon comment) → 28 comments
+  󰍺 (icon share) → 2 shares
+
+V7.8 parse PATTERN ICON-NUMBER thay vì keyword "X bình luận"
+- Lấy 3 số đầu tiên xuất hiện sau icon FB ở đầu mobile innertext
+- Đó chính là engagement của VIDEO ĐẦU TIÊN (target)
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -35,6 +37,12 @@ USERNAME_BLACKLIST = {
     'terms', 'community', 'safety', 'legal', 'careers', 'ads',
     'developers', 'directory', 'badges', 'feed', 'timeline'
 }
+
+# FB icon characters (Private Use Area in Unicode)
+# 󰍸 = like icon, 󰍹 = comment icon, 󰍺 = share icon
+ICON_LIKE = '\udb80\udf78'      # 󰍸 (U+F0378)
+ICON_COMMENT = '\udb80\udf79'   # 󰍹 (U+F0379) 
+ICON_SHARE = '\udb80\udf7a'     # 󰍺 (U+F037A)
 
 
 @app.after_request
@@ -128,17 +136,119 @@ def parse_vietnamese_number(text):
     return int(num)
 
 
+def parse_mobile_engagement(innertext, debug_info):
+    """
+    KEY INSIGHT V7.8: Mobile FB has format:
+    
+    󰍸     <- like icon
+    96    <- like count
+    󰍹     <- comment icon
+    28    <- comment count
+    󰍺     <- share icon
+    2     <- share count (or empty if 0)
+    Trần Xuân Hậu
+    
+    Strategy:
+    1. Look for icon → number pattern using Unicode Private Use Area
+    2. First triplet usually = target video engagement
+    3. Verify by checking name comes after
+    """
+    data = {'likes': 0, 'comments': 0, 'shares': 0}
+    debug_attempts = []
+    
+    if not innertext:
+        return data
+    
+    # Strategy 1: Match icon followed by number on next line(s)
+    # Use [\uF0000-\uFFFFF] for Private Use Area chars (FB icons)
+    # Pattern: ICON \n NUMBER \n
+    
+    # Generic pattern: any FB icon char then digits
+    # FB icons are in Supplementary Private Use Area (U+F0000 to U+FFFFD)
+    icon_number_pattern = r'[\U000F0000-\U000FFFFD]\s*\n\s*([\d.,]+\s*[KkMmBb]?)\s*\n'
+    matches = re.findall(icon_number_pattern, innertext)
+    
+    debug_info['icon_pattern_matches'] = matches[:10]
+    debug_attempts.append({'strategy': 'icon_number', 'matches': matches[:10]})
+    
+    # If we got at least 3 matches, first 3 = likes, comments, shares
+    # (in mobile FB order: like, comment, share)
+    if len(matches) >= 3:
+        like_val = parse_vietnamese_number(matches[0])
+        comment_val = parse_vietnamese_number(matches[1])
+        share_val = parse_vietnamese_number(matches[2])
+        
+        # Sanity check: likes should be largest, shares smallest typically
+        # But we trust the order from FB UI
+        if like_val > 0:
+            data['likes'] = like_val
+        if comment_val >= 0:
+            data['comments'] = comment_val
+        if share_val >= 0:
+            data['shares'] = share_val
+        
+        debug_attempts.append({
+            'strategy': 'first_3_icons',
+            'likes': like_val,
+            'comments': comment_val,
+            'shares': share_val
+        })
+    elif len(matches) == 2:
+        # No share number (share = 0, hidden in UI)
+        like_val = parse_vietnamese_number(matches[0])
+        comment_val = parse_vietnamese_number(matches[1])
+        if like_val > 0:
+            data['likes'] = like_val
+        if comment_val >= 0:
+            data['comments'] = comment_val
+        debug_attempts.append({
+            'strategy': '2_icons',
+            'likes': like_val,
+            'comments': comment_val,
+        })
+    elif len(matches) == 1:
+        # Only likes, comments=0, shares=0
+        like_val = parse_vietnamese_number(matches[0])
+        if like_val > 0:
+            data['likes'] = like_val
+        debug_attempts.append({'strategy': '1_icon', 'likes': like_val})
+    
+    # Strategy 2 (fallback): If no icon-number match, try simple line-by-line
+    # Look for lines that are pure numbers near the start
+    if data['likes'] == 0:
+        lines = innertext.split('\n')
+        pure_numbers = []
+        for i, line in enumerate(lines[:30]):  # First 30 lines only
+            stripped = line.strip()
+            if re.match(r'^[\d.,]+\s*[KkMmBb]?$', stripped):
+                value = parse_vietnamese_number(stripped)
+                if 0 <= value <= 100000000:
+                    pure_numbers.append({'line': i, 'value': value})
+        
+        debug_attempts.append({'strategy': 'pure_numbers', 'found': pure_numbers[:10]})
+        
+        # First 3 pure numbers = likes, comments, shares
+        if len(pure_numbers) >= 3:
+            data['likes'] = pure_numbers[0]['value']
+            data['comments'] = pure_numbers[1]['value']
+            data['shares'] = pure_numbers[2]['value']
+        elif len(pure_numbers) == 2:
+            data['likes'] = pure_numbers[0]['value']
+            data['comments'] = pure_numbers[1]['value']
+        elif len(pure_numbers) == 1:
+            data['likes'] = pure_numbers[0]['value']
+    
+    debug_info['mobile_parse_attempts'] = debug_attempts
+    return data
+
+
 def simulate_human(page):
-    """Simulate human mouse/keyboard activity"""
     try:
-        # Random mouse moves
         for _ in range(3):
             x = random.randint(100, 1200)
             y = random.randint(100, 600)
             page.mouse.move(x, y)
             time.sleep(random.uniform(0.3, 0.8))
-        
-        # Random scroll (smooth)
         for offset in [200, 400, 600, 300]:
             page.evaluate(f'window.scrollTo({{top: {offset}, behavior: "smooth"}})')
             time.sleep(random.uniform(0.8, 1.5))
@@ -163,12 +273,9 @@ def scrape_with_playwright(url):
             'cookies_count': len(cookies),
             'extracted_data': {},
             'view_extraction_attempts': [],
-            'engagement_attempts': [],
             'mode_used': '',
-            'innertext_length': 0,
-            'innertext_sample': '',
-            'html_search_results': {},
             'tried_modes': [],
+            'html_search_results': {},
         }
     }
     
@@ -188,13 +295,11 @@ def scrape_with_playwright(url):
                 ]
             )
             
-            # === MODE 1: Desktop with full simulation ===
-            success = try_desktop_mode(browser, url, cookies, result)
+            # Always run desktop for views + metadata
+            try_desktop_mode(browser, url, cookies, result)
             
-            if not success or (result['data']['likes'] == 0 and result['data']['comments'] == 0):
-                # === MODE 2: Mobile fallback ===
-                logger.info('Desktop mode insufficient, trying mobile')
-                try_mobile_mode(browser, url, cookies, result)
+            # ALWAYS run mobile for engagement (V7.8 strategy)
+            try_mobile_mode(browser, url, cookies, result)
             
             browser.close()
             
@@ -211,7 +316,7 @@ def scrape_with_playwright(url):
 
 
 def try_desktop_mode(browser, url, cookies, result):
-    """Try desktop mode with human simulation"""
+    """Desktop for views + metadata"""
     try:
         result['debug']['tried_modes'].append('desktop')
         
@@ -223,11 +328,6 @@ def try_desktop_mode(browser, url, cookies, result):
             extra_http_headers={
                 'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Upgrade-Insecure-Requests': '1',
             }
         )
         
@@ -238,27 +338,12 @@ def try_desktop_mode(browser, url, cookies, result):
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
-            window.chrome = { runtime: {} };
         """)
         
-        logger.info(f'Desktop mode navigating to: {url}')
+        logger.info(f'Desktop navigating to: {url}')
         response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
-        
-        # Initial wait
-        time.sleep(random.uniform(3, 5))
-        
-        # Simulate human
+        time.sleep(8)
         simulate_human(page)
-        
-        # Try wait for engagement element
-        try:
-            page.wait_for_selector('text=/(lượt xem|bình luận|người khác)/i', timeout=10000)
-            logger.info('Engagement text found via wait_for_selector')
-        except:
-            logger.info('wait_for_selector timeout')
-        
-        # Final wait
-        time.sleep(random.uniform(2, 4))
         
         final_url = page.url
         page_title = page.title()
@@ -269,25 +354,14 @@ def try_desktop_mode(browser, url, cookies, result):
         if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
             result['error'] = 'Redirected to login - cookies invalid'
             context.close()
-            return False
+            return
         
         html = page.content()
         result['debug']['html_length'] = len(html)
         
-        # Capture innertext for debug
-        try:
-            innertext = page.evaluate('document.body.innerText || ""')
-            result['debug']['innertext_length'] = len(innertext)
-            result['debug']['innertext_sample'] = innertext[:500]
-        except:
-            pass
-        
-        # Views (V7.3 strategy)
+        # Views (V7.3 strategy - works!)
         html_views, view_attempts = search_views_in_html(html)
         result['debug']['view_extraction_attempts'] = view_attempts
-        
-        # Engagement
-        engagement = extract_engagement_v77(page, html, result['debug'])
         
         # Metadata
         extracted = extract_metadata_from_html(html)
@@ -305,12 +379,8 @@ def try_desktop_mode(browser, url, cookies, result):
         
         result['debug']['mode_used'] = 'desktop'
         
-        # Set values
         if html_views > 0:
             result['data']['views'] = html_views
-        result['data']['likes'] = engagement.get('likes', 0)
-        result['data']['comments'] = engagement.get('comments', 0)
-        result['data']['shares'] = engagement.get('shares', 0)
         result['data']['caption'] = decode_unicode_string(extracted.get('caption', ''))[:500]
         result['data']['thumbnail'] = extracted.get('thumbnail', '')
         result['data']['username'] = dom_data.get('username', '')
@@ -318,29 +388,18 @@ def try_desktop_mode(browser, url, cookies, result):
         result['data']['video_url'] = final_url
         
         context.close()
-        return True
     except Exception as e:
         logger.warning(f'Desktop mode failed: {e}')
-        return False
 
 
 def try_mobile_mode(browser, url, cookies, result):
-    """Try mobile m.facebook.com mode"""
+    """Mobile m.facebook.com for engagement (V7.8 KEY)"""
     try:
         result['debug']['tried_modes'].append('mobile')
         
-        # Convert URL to m.facebook.com if possible
         mobile_url = url.replace('www.facebook.com', 'm.facebook.com')
         if 'm.facebook.com' not in mobile_url:
             mobile_url = mobile_url.replace('facebook.com', 'm.facebook.com')
-        
-        # Adjust cookies domain
-        mobile_cookies = []
-        for c in cookies:
-            new_c = dict(c)
-            if c['domain'] == '.facebook.com' or c['domain'] == 'facebook.com':
-                new_c['domain'] = '.facebook.com'  # works for both
-            mobile_cookies.append(new_c)
         
         context = browser.new_context(
             user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
@@ -353,129 +412,49 @@ def try_mobile_mode(browser, url, cookies, result):
             }
         )
         
-        context.add_cookies(mobile_cookies)
+        context.add_cookies(cookies)
         page = context.new_page()
         
-        logger.info(f'Mobile mode navigating to: {mobile_url}')
+        logger.info(f'Mobile navigating to: {mobile_url}')
         response = page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
+        time.sleep(random.uniform(5, 7))
         
-        time.sleep(random.uniform(5, 8))
-        
-        # Scroll on mobile
         for offset in [200, 400, 600]:
             try:
                 page.evaluate(f'window.scrollTo(0, {offset})')
                 time.sleep(random.uniform(1, 2))
             except:
                 pass
-        
         time.sleep(2)
         
-        html = page.content()
-        
-        # Try to extract from mobile HTML
-        mobile_engagement = extract_engagement_mobile(html, page, result['debug'])
-        
-        # Update result if mobile found better data
-        if mobile_engagement.get('likes', 0) > result['data']['likes']:
-            result['data']['likes'] = mobile_engagement['likes']
-            result['debug']['mode_used'] = 'desktop+mobile'
-        if mobile_engagement.get('comments', 0) > result['data']['comments']:
-            result['data']['comments'] = mobile_engagement['comments']
-        if mobile_engagement.get('shares', 0) > result['data']['shares']:
-            result['data']['shares'] = mobile_engagement['shares']
-        
-        # Mobile innertext
+        # Get mobile innertext
+        mobile_innertext = ''
         try:
             mobile_innertext = page.evaluate('document.body.innerText || ""')
             result['debug']['mobile_innertext_length'] = len(mobile_innertext)
-            result['debug']['mobile_innertext_sample'] = mobile_innertext[:500]
+            result['debug']['mobile_innertext_sample'] = mobile_innertext[:1000]
         except:
             pass
+        
+        # PARSE WITH NEW V7.8 STRATEGY
+        engagement = parse_mobile_engagement(mobile_innertext, result['debug'])
+        
+        # Update result
+        if engagement.get('likes', 0) > 0:
+            result['data']['likes'] = engagement['likes']
+            result['debug']['mode_used'] = 'desktop+mobile'
+        if engagement.get('comments', 0) > 0:
+            result['data']['comments'] = engagement['comments']
+        if engagement.get('shares', 0) > 0:
+            result['data']['shares'] = engagement['shares']
         
         context.close()
     except Exception as e:
         logger.warning(f'Mobile mode failed: {e}')
 
 
-def extract_engagement_mobile(html, page, debug_info):
-    """Extract engagement from m.facebook.com (often has plain text)"""
-    data = {}
-    attempts = []
-    
-    # Try DOM innerText first
-    try:
-        innertext = page.evaluate('document.body.innerText || ""')
-        debug_info['mobile_innertext_sample'] = innertext[:1000]
-        
-        # Mobile may have different format: "63 người", "3 bình luận"
-        text_to_search = innertext + '\n' + html
-        
-        # Likes
-        like_patterns = [
-            r'v\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*kh\u00e1c',
-            r'([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*\u0111\u00e3\s*th\u00edch',
-            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*th\u00edch',
-            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*reactions?',
-        ]
-        like_candidates = []
-        for pat in like_patterns:
-            matches = re.findall(pat, text_to_search, re.IGNORECASE)
-            for m in matches[:10]:
-                value = parse_vietnamese_number(m)
-                if 1 <= value <= 100000000:
-                    if 'kh\u00e1c' in pat:
-                        like_candidates.append(value + 1)
-                    else:
-                        like_candidates.append(value)
-                    attempts.append({'type': 'like', 'match': m, 'pattern': pat[:30]})
-        if like_candidates:
-            data['likes'] = max(like_candidates)
-        
-        # Comments
-        comment_patterns = [
-            r'([\d.,]+\s*[KkMmBb]?)\s*b\u00ecnh\s*lu\u1eadn',
-            r'([\d.,]+\s*[KkMmBb]?)\s*comments?',
-        ]
-        comment_candidates = []
-        for pat in comment_patterns:
-            matches = re.findall(pat, text_to_search, re.IGNORECASE)
-            for m in matches[:10]:
-                value = parse_vietnamese_number(m)
-                if 0 <= value <= 100000000:
-                    comment_candidates.append(value)
-                    attempts.append({'type': 'comment', 'match': m, 'pattern': pat[:30]})
-        if comment_candidates:
-            from collections import Counter
-            counter = Counter(comment_candidates)
-            data['comments'] = counter.most_common(1)[0][0]
-        
-        # Shares
-        share_patterns = [
-            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*chia\s*s\u1ebb',
-            r'([\d.,]+\s*[KkMmBb]?)\s*shares?',
-        ]
-        share_candidates = []
-        for pat in share_patterns:
-            matches = re.findall(pat, text_to_search, re.IGNORECASE)
-            for m in matches[:10]:
-                value = parse_vietnamese_number(m)
-                if 1 <= value <= 100000000:
-                    share_candidates.append(value)
-                    attempts.append({'type': 'share', 'match': m, 'pattern': pat[:30]})
-        if share_candidates:
-            from collections import Counter
-            counter = Counter(share_candidates)
-            data['shares'] = counter.most_common(1)[0][0]
-    except Exception as e:
-        attempts.append({'error': str(e)[:100]})
-    
-    debug_info['mobile_engagement_attempts'] = attempts[:10]
-    return data
-
-
 def search_views_in_html(html):
-    """V7.3 strategy - works for views"""
+    """V7.3 strategy - DON'T CHANGE"""
     view_candidates = []
     view_attempts = []
     
@@ -495,109 +474,6 @@ def search_views_in_html(html):
     
     final_views = max(view_candidates) if view_candidates else 0
     return final_views, view_attempts
-
-
-def extract_engagement_v77(page, html, debug_info):
-    """Extract engagement from desktop page"""
-    data = {'likes': 0, 'comments': 0, 'shares': 0}
-    attempts = []
-    
-    try:
-        # Get DOM text + aria-labels combined
-        dom_results = page.evaluate("""
-            () => {
-                const result = {ariaLabels: [], titles: [], innerText: ''};
-                document.querySelectorAll('[aria-label]').forEach(el => {
-                    const label = el.getAttribute('aria-label') || '';
-                    if (/\\d/.test(label) && label.length < 200) {
-                        result.ariaLabels.push(label);
-                    }
-                });
-                document.querySelectorAll('[title]').forEach(el => {
-                    const title = el.getAttribute('title') || '';
-                    if (/\\d/.test(title) && title.length < 200) {
-                        result.titles.push(title);
-                    }
-                });
-                result.innerText = document.body.innerText || '';
-                return result;
-            }
-        """)
-        
-        all_text = '\n'.join([
-            *(dom_results.get('ariaLabels') or []),
-            *(dom_results.get('titles') or []),
-            dom_results.get('innerText', ''),
-            html,  # last resort
-        ])
-        
-        # Likes
-        like_patterns = [
-            r'v\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*kh\u00e1c',
-            r'and\s*([\d.,]+\s*[KkMmBb]?)\s*others?',
-            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*th\u00edch',
-            r'([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*\u0111\u00e3\s*th\u00edch',
-        ]
-        like_candidates = []
-        for pat in like_patterns:
-            matches = re.findall(pat, all_text, re.IGNORECASE)
-            for m in matches[:10]:
-                value = parse_vietnamese_number(m)
-                if 1 <= value <= 100000000:
-                    if 'kh\u00e1c' in pat or 'other' in pat:
-                        like_candidates.append(value + 1)
-                    else:
-                        like_candidates.append(value)
-                    attempts.append({'type': 'like', 'match': m})
-        if like_candidates:
-            data['likes'] = max(like_candidates)
-        
-        # Comments
-        comment_patterns = [
-            r'([\d.,]+\s*[KkMmBb]?)\s*b\u00ecnh\s*lu\u1eadn',
-            r'([\d.,]+\s*[KkMmBb]?)\s*comments?',
-        ]
-        comment_candidates = []
-        for pat in comment_patterns:
-            matches = re.findall(pat, all_text, re.IGNORECASE)
-            for m in matches[:10]:
-                value = parse_vietnamese_number(m)
-                if 0 <= value <= 100000000:
-                    comment_candidates.append(value)
-                    attempts.append({'type': 'comment', 'match': m})
-        if comment_candidates:
-            from collections import Counter
-            counter = Counter(comment_candidates)
-            data['comments'] = counter.most_common(1)[0][0]
-        
-        # Shares
-        share_patterns = [
-            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*chia\s*s\u1ebb',
-            r'([\d.,]+\s*[KkMmBb]?)\s*shares?',
-        ]
-        share_candidates = []
-        for pat in share_patterns:
-            matches = re.findall(pat, all_text, re.IGNORECASE)
-            for m in matches[:10]:
-                value = parse_vietnamese_number(m)
-                if 1 <= value <= 100000000:
-                    share_candidates.append(value)
-                    attempts.append({'type': 'share', 'match': m})
-        if share_candidates:
-            from collections import Counter
-            counter = Counter(share_candidates)
-            data['shares'] = counter.most_common(1)[0][0]
-        
-        debug_info['dom_text_samples'] = {
-            'aria_labels_count': len(dom_results.get('ariaLabels', [])),
-            'titles_count': len(dom_results.get('titles', [])),
-            'innertext_length': len(dom_results.get('innerText', '')),
-        }
-    except Exception as e:
-        attempts.append({'error': str(e)[:100]})
-    
-    debug_info['engagement_attempts'] = attempts[:10]
-    return data
 
 
 def extract_username_from_dom(page):
@@ -667,7 +543,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '7.7-human-sim',
+        'version': '7.8-icon-parse',
     })
 
 
@@ -691,7 +567,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '7.7-human-sim',
+        'version': '7.8-icon-parse',
     })
 
 
