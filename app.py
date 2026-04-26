@@ -1,16 +1,17 @@
 """
-Rise City Facebook Scraper API - V7.5 🎩
-Apply V7.3 strategy (search Vietnamese text) cho TẤT CẢ engagement metrics:
-- views: search "X lượt xem" 
-- likes: search "X người khác", "X người đã thích" -> +1 cho người đầu
-- comments: search "X bình luận"
-- shares: search "X lượt chia sẻ"
-- username: blacklist FB system pages
+Rise City Facebook Scraper API - V7.6 🎩
+Giữ nguyên views logic (V7.3 - work).
+Fix engagement bằng:
+1. Wait 15s + click video để trigger load
+2. Capture GraphQL network responses
+3. DOM walker với aria-label, title attributes
+4. Search innerText sau khi DOM render xong
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
 import os
 import re
+import json
 import logging
 import time
 
@@ -22,7 +23,6 @@ app = Flask(__name__)
 COOKIES_PATH = os.getenv('FB_COOKIES_PATH', '/etc/secrets/cookies.txt')
 API_SECRET = os.getenv('API_SECRET', 'rise-city-secret-2026')
 
-# Blacklist FB system pages (not real usernames)
 USERNAME_BLACKLIST = {
     'recover', 'help', 'settings', 'privacy', 'home', 'login', 'logout',
     'signup', 'register', 'reg', 'reset', 'support', 'business',
@@ -127,7 +127,14 @@ def parse_vietnamese_number(text):
     return int(num)
 
 
+# Global cache for captured GraphQL responses
+captured_responses = []
+
+
 def scrape_with_playwright(url):
+    global captured_responses
+    captured_responses = []
+    
     cookies = parse_netscape_cookies(COOKIES_PATH)
     if not cookies:
         return {'success': False, 'error': 'No cookies loaded'}
@@ -144,9 +151,9 @@ def scrape_with_playwright(url):
             'cookies_count': len(cookies),
             'extracted_data': {},
             'view_extraction_attempts': [],
-            'like_extraction_attempts': [],
-            'comment_extraction_attempts': [],
-            'share_extraction_attempts': [],
+            'engagement_attempts': [],
+            'network_captures': 0,
+            'graphql_data_found': {},
             'html_search_results': {},
         }
     }
@@ -185,22 +192,54 @@ def scrape_with_playwright(url):
                 Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
             """)
             
+            # Capture GraphQL responses
+            def handle_response(response):
+                try:
+                    url_lower = response.url.lower()
+                    if 'graphql' in url_lower or '/api/graphql' in url_lower:
+                        if response.status == 200:
+                            try:
+                                body = response.text()
+                                if body and len(body) < 5000000:  # 5MB limit
+                                    captured_responses.append(body)
+                            except:
+                                pass
+                except:
+                    pass
+            
+            page.on('response', handle_response)
+            
             logger.info(f'Navigating to: {url}')
             response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
             
-            time.sleep(8)
+            # Wait LONGER for engagement to load via GraphQL
+            time.sleep(10)
             
+            # Trigger interaction to load engagement
             try:
-                page.evaluate('window.scrollTo(0, 300)')
+                # Scroll to bottom of video to trigger load comment
+                page.evaluate('window.scrollTo(0, 600)')
+                time.sleep(3)
+                page.evaluate('window.scrollTo(0, 1200)')
+                time.sleep(3)
+                # Try clicking on video area to trigger more loads
+                page.evaluate('''
+                    const video = document.querySelector('video');
+                    if (video) video.click();
+                ''')
                 time.sleep(2)
             except:
                 pass
+            
+            # Final wait
+            time.sleep(2)
             
             final_url = page.url
             page_title = page.title()
             result['debug']['final_url'] = final_url
             result['debug']['page_title'] = page_title
             result['debug']['response_status'] = response.status if response else None
+            result['debug']['network_captures'] = len(captured_responses)
             
             if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
                 result['error'] = 'Redirected to login - cookies invalid'
@@ -210,31 +249,34 @@ def scrape_with_playwright(url):
             html = page.content()
             result['debug']['html_length'] = len(html)
             
-            # SEARCH RAW HTML for ALL engagement metrics (V7.3 strategy works!)
-            html_data = search_engagement_in_html(html, result['debug'])
+            # === VIEWS - V7.3 strategy (DON'T CHANGE) ===
+            html_views, view_attempts = search_views_in_html(html)
+            result['debug']['view_extraction_attempts'] = view_attempts
             
-            # DOM walker for username (with blacklist)
-            dom_data = extract_username_from_dom(page)
+            # === ENGAGEMENT - try multiple sources ===
+            engagement = extract_engagement_multi_source(
+                page, html, captured_responses, result['debug']
+            )
             
-            # Quick check Vietnamese keywords
+            # Quick check
             result['debug']['html_search_results'] = {
                 'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
                 'has_nguoi_khac': 'ng\u01b0\u1eddi kh\u00e1c' in html,
                 'has_binh_luan': 'b\u00ecnh lu\u1eadn' in html,
                 'has_luot_chia_se': 'l\u01b0\u1ee3t chia s\u1ebb' in html,
-                'has_nguoi_khac_count': html.count('ng\u01b0\u1eddi kh\u00e1c'),
-                'has_binh_luan_count': html.count('b\u00ecnh lu\u1eadn'),
             }
             
-            # Fallback: extract metadata from HTML (caption, thumbnail, post_id)
+            # Username
+            dom_data = extract_username_from_dom(page)
+            
+            # Metadata
             extracted = extract_metadata_from_html(html)
             result['debug']['extracted_data'] = extracted
             
-            # Final values - prioritize HTML search (V7.3 strategy)
-            result['data']['views'] = html_data.get('views', 0)
-            result['data']['likes'] = html_data.get('likes', 0)
-            result['data']['comments'] = html_data.get('comments', 0)
-            result['data']['shares'] = html_data.get('shares', 0)
+            result['data']['views'] = html_views
+            result['data']['likes'] = engagement.get('likes', 0)
+            result['data']['comments'] = engagement.get('comments', 0)
+            result['data']['shares'] = engagement.get('shares', 0)
             result['data']['caption'] = decode_unicode_string(extracted.get('caption', ''))[:500]
             result['data']['thumbnail'] = extracted.get('thumbnail', '')
             result['data']['username'] = dom_data.get('username', '')
@@ -255,30 +297,17 @@ def scrape_with_playwright(url):
     return result
 
 
-def search_engagement_in_html(html, debug_info):
-    """
-    Search RAW HTML for ALL engagement metrics using Vietnamese patterns.
-    
-    Patterns:
-    - Views: "5,2K lượt xem"
-    - Likes: "62 người khác" -> +1 for the named person = 63
-    - Comments: "3 bình luận"
-    - Shares: "4 lượt chia sẻ"
-    """
-    data = {'views': 0, 'likes': 0, 'comments': 0, 'shares': 0}
-    
+def search_views_in_html(html):
+    """V7.3 strategy - DON'T CHANGE - works perfectly"""
+    view_candidates = []
     view_attempts = []
-    like_attempts = []
-    comment_attempts = []
-    share_attempts = []
     
-    # === VIEWS ===
     view_patterns = [
         r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem',
         r'([\d.,]+\s*[KkMmBb]?)\s*l\\u01b0\\u1ee3t\s*xem',
         r'([\d.,]+\s*[KkMmBb]?)\s*l\u1ea7n\s*xem',
     ]
-    view_candidates = []
+    
     for pat in view_patterns:
         matches = re.findall(pat, html, re.IGNORECASE)
         for m in matches[:20]:
@@ -286,98 +315,199 @@ def search_engagement_in_html(html, debug_info):
             if 10 <= value <= 100000000:
                 view_candidates.append(value)
                 view_attempts.append({'match': str(m)[:30], 'value': value})
-    if view_candidates:
-        data['views'] = max(view_candidates)
     
-    # === LIKES === 
-    # Pattern: "62 người khác" → +1 for the named person = 63 likes
-    # Also: "Trần Xuân Hậu và 62 người khác"
-    like_patterns = [
-        r'v\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*kh\u00e1c',
-        r'v\\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\\u01b0\\u1eddi\s*kh\\u00e1c',
-        r'and\s*([\d.,]+\s*[KkMmBb]?)\s*others?',
-    ]
-    like_candidates_with_plus_one = []
-    for pat in like_patterns:
-        matches = re.findall(pat, html, re.IGNORECASE)
-        for m in matches[:20]:
-            value = parse_vietnamese_number(m)
-            if 0 <= value <= 100000000:
-                # +1 because there's also the named person
-                total = value + 1
-                like_candidates_with_plus_one.append(total)
-                like_attempts.append({'match': str(m)[:30], 'value': value, 'total_with_named': total})
+    final_views = max(view_candidates) if view_candidates else 0
+    return final_views, view_attempts
+
+
+def extract_engagement_multi_source(page, html, network_responses, debug_info):
+    """
+    Try MULTIPLE sources to find engagement:
+    1. Network captured GraphQL responses
+    2. DOM with aria-label/title (after JS render)
+    3. innerText after wait
+    4. HTML search (fallback)
+    """
+    data = {'likes': 0, 'comments': 0, 'shares': 0}
+    attempts = []
+    graphql_found = {}
     
-    # Fallback patterns: direct like count
-    if not like_candidates_with_plus_one:
-        fallback_like_patterns = [
-            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*th\u00edch',
-            r'([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*\u0111\u00e3\s*th\u00edch',
-            r'([\d.,]+\s*[KkMmBb]?)\s*reactions?',
-        ]
-        for pat in fallback_like_patterns:
-            matches = re.findall(pat, html, re.IGNORECASE)
-            for m in matches[:20]:
-                value = parse_vietnamese_number(m)
-                if 1 <= value <= 100000000:
-                    like_candidates_with_plus_one.append(value)
-                    like_attempts.append({'match': str(m)[:30], 'value': value, 'fallback': True})
+    # === SOURCE 1: GraphQL captured responses ===
+    for resp_body in network_responses:
+        try:
+            # Try parse as JSON or find JSON-like patterns
+            
+            # Reaction count
+            for pat in [
+                r'"reaction_count"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
+                r'"likers"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
+                r'"reactors"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
+                r'"top_reactions"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
+            ]:
+                m = re.search(pat, resp_body)
+                if m:
+                    val = int(m.group(1))
+                    if val > data['likes']:
+                        data['likes'] = val
+                        graphql_found['likes_pattern'] = pat[:40]
+                        graphql_found['likes_value'] = val
+                        break
+            
+            # Comments
+            for pat in [
+                r'"total_comment_count"\s*:\s*(\d+)',
+                r'"comment_count"\s*:\s*\{[^}]*"total_count"\s*:\s*(\d+)',
+                r'"comments"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
+            ]:
+                m = re.search(pat, resp_body)
+                if m:
+                    val = int(m.group(1))
+                    if val > data['comments']:
+                        data['comments'] = val
+                        graphql_found['comments_pattern'] = pat[:40]
+                        graphql_found['comments_value'] = val
+                        break
+            
+            # Shares
+            for pat in [
+                r'"share_count"\s*:\s*\{[^}]*"count"\s*:\s*(\d+)',
+                r'"reshare_count"\s*:\s*(\d+)',
+                r'"share_count"\s*:\s*(\d+)',
+            ]:
+                m = re.search(pat, resp_body)
+                if m:
+                    val = int(m.group(1))
+                    if val > data['shares']:
+                        data['shares'] = val
+                        graphql_found['shares_pattern'] = pat[:40]
+                        graphql_found['shares_value'] = val
+                        break
+        except:
+            continue
     
-    if like_candidates_with_plus_one:
-        data['likes'] = max(like_candidates_with_plus_one)
+    debug_info['graphql_data_found'] = graphql_found
     
-    # === COMMENTS ===
-    comment_patterns = [
-        r'([\d.,]+\s*[KkMmBb]?)\s*b\u00ecnh\s*lu\u1eadn',
-        r'([\d.,]+\s*[KkMmBb]?)\s*b\\u00ecnh\s*lu\\u1eadn',
-        r'([\d.,]+\s*[KkMmBb]?)\s*comments?',
-    ]
-    comment_candidates = []
-    for pat in comment_patterns:
-        matches = re.findall(pat, html, re.IGNORECASE)
-        for m in matches[:20]:
-            value = parse_vietnamese_number(m)
-            if 0 <= value <= 100000000:
-                comment_candidates.append(value)
-                comment_attempts.append({'match': str(m)[:30], 'value': value})
-    if comment_candidates:
-        # Take most common (mode-like) - smallest sensible value usually correct
-        # Sort and take the value that appears most often
-        from collections import Counter
-        counter = Counter(comment_candidates)
-        most_common = counter.most_common(1)[0][0]
-        data['comments'] = most_common
+    # === SOURCE 2: DOM with aria-label / title attributes ===
+    if data['likes'] == 0 or data['comments'] == 0 or data['shares'] == 0:
+        try:
+            dom_results = page.evaluate("""
+                () => {
+                    const result = {
+                        ariaLabels: [],
+                        titles: [],
+                        innerText: ''
+                    };
+                    
+                    // Get all aria-labels and titles that contain numbers
+                    document.querySelectorAll('[aria-label]').forEach(el => {
+                        const label = el.getAttribute('aria-label') || '';
+                        if (/\\d/.test(label) && label.length < 200) {
+                            result.ariaLabels.push(label);
+                        }
+                    });
+                    
+                    document.querySelectorAll('[title]').forEach(el => {
+                        const title = el.getAttribute('title') || '';
+                        if (/\\d/.test(title) && title.length < 200) {
+                            result.titles.push(title);
+                        }
+                    });
+                    
+                    // Get full innerText
+                    result.innerText = document.body.innerText || '';
+                    
+                    return result;
+                }
+            """)
+            
+            # Combine all text sources
+            all_text_sources = []
+            if dom_results.get('ariaLabels'):
+                all_text_sources.extend(dom_results['ariaLabels'])
+            if dom_results.get('titles'):
+                all_text_sources.extend(dom_results['titles'])
+            if dom_results.get('innerText'):
+                all_text_sources.append(dom_results['innerText'])
+            
+            combined_text = '\n'.join(all_text_sources)
+            
+            # Search for likes pattern
+            if data['likes'] == 0:
+                like_patterns = [
+                    r'v\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*kh\u00e1c',
+                    r'and\s*([\d.,]+\s*[KkMmBb]?)\s*others?',
+                    r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*th\u00edch',
+                    r'([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*\u0111\u00e3\s*th\u00edch',
+                    r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*reactions?',
+                ]
+                like_candidates = []
+                for pat in like_patterns:
+                    matches = re.findall(pat, combined_text, re.IGNORECASE)
+                    for m in matches[:10]:
+                        value = parse_vietnamese_number(m)
+                        if 1 <= value <= 100000000:
+                            # +1 if it's "and X others" pattern
+                            if 'kh\u00e1c' in pat or 'other' in pat:
+                                like_candidates.append(value + 1)
+                            else:
+                                like_candidates.append(value)
+                            attempts.append({'type': 'like', 'match': m, 'pattern': pat[:30]})
+                if like_candidates:
+                    data['likes'] = max(like_candidates)
+            
+            # Search for comments pattern
+            if data['comments'] == 0:
+                comment_patterns = [
+                    r'([\d.,]+\s*[KkMmBb]?)\s*b\u00ecnh\s*lu\u1eadn',
+                    r'([\d.,]+\s*[KkMmBb]?)\s*comments?',
+                ]
+                comment_candidates = []
+                for pat in comment_patterns:
+                    matches = re.findall(pat, combined_text, re.IGNORECASE)
+                    for m in matches[:10]:
+                        value = parse_vietnamese_number(m)
+                        if 0 <= value <= 100000000:
+                            comment_candidates.append(value)
+                            attempts.append({'type': 'comment', 'match': m, 'pattern': pat[:30]})
+                if comment_candidates:
+                    # Take most common
+                    from collections import Counter
+                    counter = Counter(comment_candidates)
+                    data['comments'] = counter.most_common(1)[0][0]
+            
+            # Search for shares pattern
+            if data['shares'] == 0:
+                share_patterns = [
+                    r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*chia\s*s\u1ebb',
+                    r'([\d.,]+\s*[KkMmBb]?)\s*shares?',
+                ]
+                share_candidates = []
+                for pat in share_patterns:
+                    matches = re.findall(pat, combined_text, re.IGNORECASE)
+                    for m in matches[:10]:
+                        value = parse_vietnamese_number(m)
+                        if 1 <= value <= 100000000:
+                            share_candidates.append(value)
+                            attempts.append({'type': 'share', 'match': m, 'pattern': pat[:30]})
+                if share_candidates:
+                    from collections import Counter
+                    counter = Counter(share_candidates)
+                    data['shares'] = counter.most_common(1)[0][0]
+            
+            debug_info['dom_text_samples'] = {
+                'aria_labels_count': len(dom_results.get('ariaLabels', [])),
+                'titles_count': len(dom_results.get('titles', [])),
+                'innertext_length': len(dom_results.get('innerText', '')),
+                'first_3_aria_labels': dom_results.get('ariaLabels', [])[:3],
+            }
+        except Exception as e:
+            attempts.append({'error': str(e)[:100]})
     
-    # === SHARES ===
-    share_patterns = [
-        r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*chia\s*s\u1ebb',
-        r'([\d.,]+\s*[KkMmBb]?)\s*l\\u01b0\\u1ee3t\s*chia\s*s\\u1ebb',
-        r'([\d.,]+\s*[KkMmBb]?)\s*shares?\b',
-    ]
-    share_candidates = []
-    for pat in share_patterns:
-        matches = re.findall(pat, html, re.IGNORECASE)
-        for m in matches[:20]:
-            value = parse_vietnamese_number(m)
-            if 1 <= value <= 100000000:
-                share_candidates.append(value)
-                share_attempts.append({'match': str(m)[:30], 'value': value})
-    if share_candidates:
-        from collections import Counter
-        counter = Counter(share_candidates)
-        most_common = counter.most_common(1)[0][0]
-        data['shares'] = most_common
-    
-    debug_info['view_extraction_attempts'] = view_attempts[:10]
-    debug_info['like_extraction_attempts'] = like_attempts[:10]
-    debug_info['comment_extraction_attempts'] = comment_attempts[:10]
-    debug_info['share_extraction_attempts'] = share_attempts[:10]
-    
+    debug_info['engagement_attempts'] = attempts[:15]
     return data
 
 
 def extract_username_from_dom(page):
-    """Get username from profile link, with blacklist filter"""
     data = {}
     try:
         js_results = page.evaluate("""
@@ -407,14 +537,13 @@ def extract_username_from_dom(page):
                 if username and username not in USERNAME_BLACKLIST:
                     data['username'] = m['username']
                     break
-    except Exception as e:
+    except:
         pass
     
     return data
 
 
 def extract_metadata_from_html(html):
-    """Extract caption, thumbnail, post_id from HTML"""
     data = {}
     patterns = {
         'post_id': [
@@ -448,7 +577,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '7.5-vietnamese-text',
+        'version': '7.6-network-capture',
     })
 
 
@@ -472,7 +601,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '7.5-vietnamese-text',
+        'version': '7.6-network-capture',
     })
 
 
