@@ -1,20 +1,13 @@
 services:
   - type: web
     name: rise-city-fb-scraper
-    runtime: python
-    plan: free
+    runtime: docker
+    plan: starter
     region: singapore
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-      playwright install chromium
-    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 180 app:app
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.10.13
       - key: API_SECRET
         sync: false
       - key: FB_COOKIES_PATH
         value: /etc/secrets/cookies.txt
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/.cache/ms-playwright
