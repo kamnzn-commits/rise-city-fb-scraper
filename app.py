@@ -1,10 +1,11 @@
 """
-Rise City Facebook Scraper API - V7.4 🎩
-Combine V7.1 + V7.3:
-- Wait 8s (V7.1 - lấy đúng likes/comments)
-- Search HTML patterns (V7.3 - lấy đúng views)
-- DOM walker cho shares (tìm "4 lượt chia sẻ")
-- Username từ profile link
+Rise City Facebook Scraper API - V7.5 🎩
+Apply V7.3 strategy (search Vietnamese text) cho TẤT CẢ engagement metrics:
+- views: search "X lượt xem" 
+- likes: search "X người khác", "X người đã thích" -> +1 cho người đầu
+- comments: search "X bình luận"
+- shares: search "X lượt chia sẻ"
+- username: blacklist FB system pages
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -20,6 +21,19 @@ app = Flask(__name__)
 
 COOKIES_PATH = os.getenv('FB_COOKIES_PATH', '/etc/secrets/cookies.txt')
 API_SECRET = os.getenv('API_SECRET', 'rise-city-secret-2026')
+
+# Blacklist FB system pages (not real usernames)
+USERNAME_BLACKLIST = {
+    'recover', 'help', 'settings', 'privacy', 'home', 'login', 'logout',
+    'signup', 'register', 'reg', 'reset', 'support', 'business',
+    'marketplace', 'gaming', 'watch', 'reel', 'reels', 'share', 'video',
+    'photo', 'permalink', 'profile.php', 'people', 'pages', 'groups',
+    'events', 'memories', 'saved', 'notifications', 'messages',
+    'friends', 'public', 'media', 'hashtag', 'search', 'browse',
+    'lite', 'mobile', 'm', 'www', 'web', 'about', 'policies',
+    'terms', 'community', 'safety', 'legal', 'careers', 'ads',
+    'developers', 'directory', 'badges', 'feed', 'timeline'
+}
 
 
 @app.after_request
@@ -130,6 +144,8 @@ def scrape_with_playwright(url):
             'cookies_count': len(cookies),
             'extracted_data': {},
             'view_extraction_attempts': [],
+            'like_extraction_attempts': [],
+            'comment_extraction_attempts': [],
             'share_extraction_attempts': [],
             'html_search_results': {},
         }
@@ -172,10 +188,8 @@ def scrape_with_playwright(url):
             logger.info(f'Navigating to: {url}')
             response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
             
-            # Wait 8s like V7.1 (better for likes/comments)
             time.sleep(8)
             
-            # Light scroll
             try:
                 page.evaluate('window.scrollTo(0, 300)')
                 time.sleep(2)
@@ -196,32 +210,34 @@ def scrape_with_playwright(url):
             html = page.content()
             result['debug']['html_length'] = len(html)
             
-            # SEARCH RAW HTML for views (V7.3 method - works!)
-            html_views, view_attempts = search_views_in_html(html)
-            result['debug']['view_extraction_attempts'] = view_attempts
+            # SEARCH RAW HTML for ALL engagement metrics (V7.3 strategy works!)
+            html_data = search_engagement_in_html(html, result['debug'])
             
-            # DOM walker for shares (search rendered DOM text)
-            dom_data = extract_dom_for_shares(page, result['debug'])
+            # DOM walker for username (with blacklist)
+            dom_data = extract_username_from_dom(page)
             
             # Quick check Vietnamese keywords
             result['debug']['html_search_results'] = {
                 'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
+                'has_nguoi_khac': 'ng\u01b0\u1eddi kh\u00e1c' in html,
+                'has_binh_luan': 'b\u00ecnh lu\u1eadn' in html,
                 'has_luot_chia_se': 'l\u01b0\u1ee3t chia s\u1ebb' in html,
-                'has_luot_xem_count': html.count('l\u01b0\u1ee3t xem'),
-                'has_luot_chia_se_count': html.count('l\u01b0\u1ee3t chia s\u1ebb'),
+                'has_nguoi_khac_count': html.count('ng\u01b0\u1eddi kh\u00e1c'),
+                'has_binh_luan_count': html.count('b\u00ecnh lu\u1eadn'),
             }
             
-            extracted = extract_from_html(html)
+            # Fallback: extract metadata from HTML (caption, thumbnail, post_id)
+            extracted = extract_metadata_from_html(html)
             result['debug']['extracted_data'] = extracted
             
-            # Final values
-            result['data']['views'] = max(html_views, extracted.get('views', 0))
-            result['data']['likes'] = extracted.get('likes', 0)
-            result['data']['comments'] = extracted.get('comments', 0)
-            result['data']['shares'] = max(dom_data.get('shares', 0), extracted.get('shares', 0))
+            # Final values - prioritize HTML search (V7.3 strategy)
+            result['data']['views'] = html_data.get('views', 0)
+            result['data']['likes'] = html_data.get('likes', 0)
+            result['data']['comments'] = html_data.get('comments', 0)
+            result['data']['shares'] = html_data.get('shares', 0)
             result['data']['caption'] = decode_unicode_string(extracted.get('caption', ''))[:500]
             result['data']['thumbnail'] = extracted.get('thumbnail', '')
-            result['data']['username'] = extracted.get('username', '') or dom_data.get('username', '')
+            result['data']['username'] = dom_data.get('username', '')
             result['data']['post_id'] = extracted.get('post_id')
             result['data']['video_url'] = final_url
             
@@ -239,146 +255,171 @@ def scrape_with_playwright(url):
     return result
 
 
-def search_views_in_html(html):
-    """Search RAW HTML for view count - V7.3 method (works!)"""
-    view_candidates = []
-    view_attempts = []
+def search_engagement_in_html(html, debug_info):
+    """
+    Search RAW HTML for ALL engagement metrics using Vietnamese patterns.
     
+    Patterns:
+    - Views: "5,2K lượt xem"
+    - Likes: "62 người khác" -> +1 for the named person = 63
+    - Comments: "3 bình luận"
+    - Shares: "4 lượt chia sẻ"
+    """
+    data = {'views': 0, 'likes': 0, 'comments': 0, 'shares': 0}
+    
+    view_attempts = []
+    like_attempts = []
+    comment_attempts = []
+    share_attempts = []
+    
+    # === VIEWS ===
     view_patterns = [
         r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem',
         r'([\d.,]+\s*[KkMmBb]?)\s*l\\u01b0\\u1ee3t\s*xem',
         r'([\d.,]+\s*[KkMmBb]?)\s*l\u1ea7n\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?)\s*views?\b',
     ]
-    
+    view_candidates = []
     for pat in view_patterns:
         matches = re.findall(pat, html, re.IGNORECASE)
         for m in matches[:20]:
             value = parse_vietnamese_number(m)
             if 10 <= value <= 100000000:
                 view_candidates.append(value)
-                view_attempts.append({
-                    'pattern': pat[:40],
-                    'match': str(m)[:30],
-                    'value': value
-                })
+                view_attempts.append({'match': str(m)[:30], 'value': value})
+    if view_candidates:
+        data['views'] = max(view_candidates)
     
-    final_views = max(view_candidates) if view_candidates else 0
-    return final_views, view_attempts
+    # === LIKES === 
+    # Pattern: "62 người khác" → +1 for the named person = 63 likes
+    # Also: "Trần Xuân Hậu và 62 người khác"
+    like_patterns = [
+        r'v\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*kh\u00e1c',
+        r'v\\u00e0\s*([\d.,]+\s*[KkMmBb]?)\s*ng\\u01b0\\u1eddi\s*kh\\u00e1c',
+        r'and\s*([\d.,]+\s*[KkMmBb]?)\s*others?',
+    ]
+    like_candidates_with_plus_one = []
+    for pat in like_patterns:
+        matches = re.findall(pat, html, re.IGNORECASE)
+        for m in matches[:20]:
+            value = parse_vietnamese_number(m)
+            if 0 <= value <= 100000000:
+                # +1 because there's also the named person
+                total = value + 1
+                like_candidates_with_plus_one.append(total)
+                like_attempts.append({'match': str(m)[:30], 'value': value, 'total_with_named': total})
+    
+    # Fallback patterns: direct like count
+    if not like_candidates_with_plus_one:
+        fallback_like_patterns = [
+            r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*th\u00edch',
+            r'([\d.,]+\s*[KkMmBb]?)\s*ng\u01b0\u1eddi\s*\u0111\u00e3\s*th\u00edch',
+            r'([\d.,]+\s*[KkMmBb]?)\s*reactions?',
+        ]
+        for pat in fallback_like_patterns:
+            matches = re.findall(pat, html, re.IGNORECASE)
+            for m in matches[:20]:
+                value = parse_vietnamese_number(m)
+                if 1 <= value <= 100000000:
+                    like_candidates_with_plus_one.append(value)
+                    like_attempts.append({'match': str(m)[:30], 'value': value, 'fallback': True})
+    
+    if like_candidates_with_plus_one:
+        data['likes'] = max(like_candidates_with_plus_one)
+    
+    # === COMMENTS ===
+    comment_patterns = [
+        r'([\d.,]+\s*[KkMmBb]?)\s*b\u00ecnh\s*lu\u1eadn',
+        r'([\d.,]+\s*[KkMmBb]?)\s*b\\u00ecnh\s*lu\\u1eadn',
+        r'([\d.,]+\s*[KkMmBb]?)\s*comments?',
+    ]
+    comment_candidates = []
+    for pat in comment_patterns:
+        matches = re.findall(pat, html, re.IGNORECASE)
+        for m in matches[:20]:
+            value = parse_vietnamese_number(m)
+            if 0 <= value <= 100000000:
+                comment_candidates.append(value)
+                comment_attempts.append({'match': str(m)[:30], 'value': value})
+    if comment_candidates:
+        # Take most common (mode-like) - smallest sensible value usually correct
+        # Sort and take the value that appears most often
+        from collections import Counter
+        counter = Counter(comment_candidates)
+        most_common = counter.most_common(1)[0][0]
+        data['comments'] = most_common
+    
+    # === SHARES ===
+    share_patterns = [
+        r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*chia\s*s\u1ebb',
+        r'([\d.,]+\s*[KkMmBb]?)\s*l\\u01b0\\u1ee3t\s*chia\s*s\\u1ebb',
+        r'([\d.,]+\s*[KkMmBb]?)\s*shares?\b',
+    ]
+    share_candidates = []
+    for pat in share_patterns:
+        matches = re.findall(pat, html, re.IGNORECASE)
+        for m in matches[:20]:
+            value = parse_vietnamese_number(m)
+            if 1 <= value <= 100000000:
+                share_candidates.append(value)
+                share_attempts.append({'match': str(m)[:30], 'value': value})
+    if share_candidates:
+        from collections import Counter
+        counter = Counter(share_candidates)
+        most_common = counter.most_common(1)[0][0]
+        data['shares'] = most_common
+    
+    debug_info['view_extraction_attempts'] = view_attempts[:10]
+    debug_info['like_extraction_attempts'] = like_attempts[:10]
+    debug_info['comment_extraction_attempts'] = comment_attempts[:10]
+    debug_info['share_extraction_attempts'] = share_attempts[:10]
+    
+    return data
 
 
-def extract_dom_for_shares(page, debug_info):
-    """DOM walker for shares + username (text rendered by FB)"""
+def extract_username_from_dom(page):
+    """Get username from profile link, with blacklist filter"""
     data = {}
-    share_attempts = []
-    
     try:
         js_results = page.evaluate("""
             () => {
-                const results = {
-                    shareMatches: [],
-                    usernameMatches: []
-                };
-                
-                // Get all visible text from page
-                const allText = document.body.innerText || '';
-                
-                // Match share patterns: "4 lượt chia sẻ", "10 chia sẻ"
-                const sharePattern = /([\\d.,]+\\s*[KkMmBb]?)\\s*(l\u01b0\u1ee3t chia s\u1ebb|chia s\u1ebb|shares?)/gi;
-                let shareMatch;
-                while ((shareMatch = sharePattern.exec(allText)) !== null) {
-                    results.shareMatches.push({
-                        number: shareMatch[1].trim(),
-                        context: shareMatch[0]
-                    });
-                }
-                
-                // Find username from profile links
+                const results = [];
                 const profileLinks = document.querySelectorAll('a[href*="/"]');
                 for (const link of profileLinks) {
                     const href = link.getAttribute('href') || '';
                     const match = href.match(/^https?:\\/\\/(?:www\\.|m\\.)?facebook\\.com\\/([a-zA-Z0-9.]+)(?:\\/|$|\\?)/);
-                    if (match && !['reel', 'share', 'video', 'watch', 'photo', 'permalink', 'profile.php', 'login'].includes(match[1])) {
+                    if (match) {
                         const text = (link.textContent || '').trim();
                         if (text && text.length > 1 && text.length < 100) {
-                            results.usernameMatches.push({
+                            results.push({
                                 username: match[1],
                                 displayName: text
                             });
                         }
                     }
                 }
-                
-                return results;
+                return results.slice(0, 20);
             }
         """)
         
-        # Process shares
-        if js_results.get('shareMatches'):
-            share_candidates = []
-            for m in js_results['shareMatches']:
-                value = parse_vietnamese_number(m['number'])
-                if 1 <= value <= 100000000:
-                    share_candidates.append(value)
-                    share_attempts.append({
-                        'number': m['number'],
-                        'context': m['context'][:80],
-                        'value': value
-                    })
-            if share_candidates:
-                # Take median (avoid outliers)
-                sorted_shares = sorted(share_candidates)
-                data['shares'] = sorted_shares[len(sorted_shares) // 2]
-        
-        # Username
-        if js_results.get('usernameMatches'):
-            for m in js_results['usernameMatches'][:5]:
-                if m.get('username'):
+        if js_results:
+            for m in js_results:
+                username = m.get('username', '').lower()
+                if username and username not in USERNAME_BLACKLIST:
                     data['username'] = m['username']
                     break
-    
     except Exception as e:
-        share_attempts.append({'error': str(e)[:100]})
+        pass
     
-    debug_info['share_extraction_attempts'] = share_attempts
     return data
 
 
-def extract_from_html(html):
+def extract_metadata_from_html(html):
+    """Extract caption, thumbnail, post_id from HTML"""
     data = {}
     patterns = {
-        'views': [
-            r'"video_view_count[":\s]*(\d+)',
-            r'"play_count[":\s]*(\d+)',
-            r'"viewCount[":\s]*(\d+)',
-            r'"unified_view_count_renderer"[^}]*"count[":\s]*(\d+)',
-            r'"reels_view_count[":\s]*(\d+)',
-            r'"organic_view_count[":\s]*(\d+)',
-            r'"playbackVideoMetadata"[^}]*"viewCount[":\s]*(\d+)',
-        ],
-        'likes': [
-            r'"reaction_count"[^}]*"count[":\s]*(\d+)',
-            r'"top_reactions"[^}]*"count[":\s]*(\d+)',
-            r'"likers"[^}]*"count[":\s]*(\d+)',
-            r'"reactors"[^}]*"count[":\s]*(\d+)',
-        ],
-        'comments': [
-            r'"total_comment_count[":\s]*(\d+)',
-            r'"comment_count"[^}]*"total_count[":\s]*(\d+)',
-        ],
-        'shares': [
-            r'"share_count"[^}]*"count[":\s]*(\d+)',
-            r'"reshare_count[":\s]*(\d+)',
-            r'"share_count[":\s]*(\d+)',
-        ],
         'post_id': [
             r'"video_id[":\s]*"(\d+)"',
             r'"top_level_post_id[":\s]*"(\d+)"',
-        ],
-        'username': [
-            r'"page_name[":\s]*"([^"]+)"',
-            r'"profile_url[":\s]*"https://www\.facebook\.com/([^/"]+)"',
-            r'"actor_username[":\s]*"([^"]+)"',
         ],
         'caption': [
             r'"message[":\s]*\{[^}]*"text[":\s]*"([^"]+)"',
@@ -395,16 +436,10 @@ def extract_from_html(html):
             match = re.search(pat, html)
             if match:
                 value = match.group(1)
-                if field in ['views', 'likes', 'comments', 'shares']:
-                    parsed = parse_vietnamese_number(value)
-                    if parsed > 0:
-                        data[field] = parsed
-                        break
-                else:
-                    cleaned = value.replace('\\u003C', '<').replace('\\/', '/').replace('\\u0026', '&')
-                    if cleaned:
-                        data[field] = cleaned[:500]
-                        break
+                cleaned = value.replace('\\u003C', '<').replace('\\/', '/').replace('\\u0026', '&')
+                if cleaned:
+                    data[field] = cleaned[:500]
+                    break
     return data
 
 
@@ -413,7 +448,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '7.4-combined',
+        'version': '7.5-vietnamese-text',
     })
 
 
@@ -437,7 +472,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '7.4-combined',
+        'version': '7.5-vietnamese-text',
     })
 
 
