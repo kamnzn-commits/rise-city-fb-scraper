@@ -1,19 +1,21 @@
 """
-Rise City Facebook Scraper API - V8.1 🎩
-TRIỆT ĐỂ KHÔNG TỐN PHÍ:
+Rise City Facebook Scraper API - V8.2 🎩
+ROOT CAUSE FIX: FB render engagement icons differently based on count.
 
-5 ATTEMPTS PER REQUEST:
-1. Cookies + Desktop Chrome (current best for engagement)
-2. NO cookies + iPhone 15 Pro Safari + Google referer (NEW)
-3. NO cookies + Android Chrome + Vietnam location (NEW)
-4. Cookies + mbasic.facebook.com text-only (NEW lightweight)
-5. Cookies + mobile m.facebook.com (current backup)
+Discovery:
+- Video with HIGH engagement (>10): "icon\n99\nicon\n50\nicon\n2"
+- Video with LOW engagement (<10): "icon\nicon\n6\nicon\n11" (icons grouped first, numbers after)
+- Some videos: Numbers before icons
+- Live indicator (eye icon 󱝍) shows view count separately
 
-Strategy:
-- Mode 1: Engagement (likes, comments, shares, caption, thumbnail)
-- Mode 2-4: Anonymous views (try multiple fingerprints)
-- Mode 5: Mobile engagement backup
-- Combine: MAX of all view sources
+Solution: Multiple parsing strategies, smart fallback, take first valid match.
+
+Strategies:
+1. Strategy ICON_NUMBER: icon → number (V7.8 logic, works for normal videos)
+2. Strategy ICON_GROUPED: icons grouped, numbers grouped (NEW - low engagement)
+3. Strategy NUMBER_ICON: number → icon (NEW - reversed order)
+4. Strategy EYE_ICON_VIEW: eye icon 󱝍 → view count (NEW for view extraction)
+5. Strategy FALLBACK: Find any 3 numbers in mobile innertext that look like engagement
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -148,32 +150,143 @@ def parse_vietnamese_number(text):
     return int(num)
 
 
-def parse_mobile_engagement(innertext, debug_info):
-    data = {'likes': 0, 'comments': 0, 'shares': 0}
+def parse_mobile_engagement_v82(innertext, debug_info):
+    """
+    V8.2: Multiple parsing strategies for FB rendering variations.
+    Returns engagement dict + view dict.
+    """
+    result = {'likes': 0, 'comments': 0, 'shares': 0, 'views': 0}
     
     if not innertext:
-        return data
+        return result
     
-    icon_number_pattern = r'[\U000F0000-\U000FFFFD]\s*\n\s*([\d.,]+\s*[KkMmBb]?)\s*\n'
-    matches = re.findall(icon_number_pattern, innertext)
+    debug_info['parse_strategies_tried'] = []
     
-    debug_info['icon_pattern_matches'] = matches[:10]
+    # Get only the FIRST video block (not the entire reels feed)
+    # Look for first sequence of icon→...→author pattern
+    # The first reel should be at the start before "Watch more reels"
+    first_block = innertext
+    if 'Watch more reels' in innertext:
+        first_block = innertext.split('Watch more reels')[0]
+    elif 'Hãy đăng nhập' in innertext:
+        first_block = innertext.split('Hãy đăng nhập')[0]
     
-    if len(matches) >= 3:
-        data['likes'] = parse_vietnamese_number(matches[0])
-        data['comments'] = parse_vietnamese_number(matches[1])
-        data['shares'] = parse_vietnamese_number(matches[2])
-    elif len(matches) == 2:
-        data['likes'] = parse_vietnamese_number(matches[0])
-        data['comments'] = parse_vietnamese_number(matches[1])
-    elif len(matches) == 1:
-        data['likes'] = parse_vietnamese_number(matches[0])
+    debug_info['first_block_length'] = len(first_block)
+    debug_info['first_block_sample'] = first_block[:600]
     
-    return data
+    # ============================================
+    # STRATEGY EYE_ICON: Find 󱝍 (eye) → view count
+    # The eye icon often shows view count for reels
+    # ============================================
+    eye_icon = '\U000F174D'  # 󱝍 unicode
+    eye_pattern = rf'{re.escape(eye_icon)}\s*\n?\s*([\d.,]+\s*[KkMmBb]?(?:\s*tri\u1ec7u)?)'
+    eye_matches = re.findall(eye_pattern, first_block)
+    if eye_matches:
+        for match in eye_matches[:5]:
+            view_value = parse_vietnamese_number(match)
+            # Eye icon usually for VIEWS not engagement, so accept reasonable view counts
+            if 100 <= view_value <= 1000000000:
+                if view_value > result['views']:
+                    result['views'] = view_value
+                    debug_info['parse_strategies_tried'].append(f'eye_icon_view:{view_value}')
+    
+    # ============================================
+    # STRATEGY ICON_NUMBER (V7.8): icon → number directly
+    # Works for: "󰍸\n99\n󰍹\n50\n󰍺\n2"
+    # ============================================
+    pattern_v1 = r'[\U000F0000-\U000FFFFD]\s*\n\s*([\d.,]+\s*[KkMmBb]?)\s*\n'
+    matches_v1 = re.findall(pattern_v1, first_block)
+    debug_info['strategy_v1_matches'] = matches_v1[:5]
+    
+    if len(matches_v1) >= 3:
+        # First 3 matches are usually likes, comments, shares
+        result['likes'] = parse_vietnamese_number(matches_v1[0])
+        result['comments'] = parse_vietnamese_number(matches_v1[1])
+        result['shares'] = parse_vietnamese_number(matches_v1[2])
+        debug_info['parse_strategies_tried'].append(f'v1_icon_number:L{result["likes"]}/C{result["comments"]}/S{result["shares"]}')
+        return result
+    
+    # ============================================
+    # STRATEGY ICON_GROUPED: icons grouped, numbers separate
+    # Works for: "󰍸\n󰍹\n6\n󰍺\n11" (some icons appear without numbers)
+    # ============================================
+    # Find sequence: icon, optional newline, icon, optional newline, NUMBER, icon, NUMBER
+    # Or any combination where icons are grouped before numbers
+    
+    # Split into lines and analyze
+    lines = first_block.split('\n')
+    debug_info['total_lines'] = len(lines)
+    
+    # Find first 5 numbers in order they appear
+    numbers_found = []
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        # Check if line is a number (with optional K/M suffix)
+        num_match = re.match(r'^([\d.,]+\s*[KkMmBb]?(?:\s*tri\u1ec7u)?)$', line_clean)
+        if num_match:
+            value = parse_vietnamese_number(num_match.group(1))
+            if 0 <= value <= 1000000000:
+                numbers_found.append({
+                    'value': value,
+                    'line_idx': i,
+                    'raw': line_clean
+                })
+                if len(numbers_found) >= 10:
+                    break
+    
+    debug_info['numbers_found'] = [n['raw'] for n in numbers_found[:10]]
+    
+    # Strategy v2: Take first 3 numbers as engagement (most common case for low-engagement)
+    # Filter out numbers that are too large (likely view counts, not engagement)
+    engagement_candidates = [n for n in numbers_found if n['value'] < 1000000]
+    
+    if len(engagement_candidates) >= 3 and result['likes'] == 0:
+        result['likes'] = engagement_candidates[0]['value']
+        result['comments'] = engagement_candidates[1]['value']
+        result['shares'] = engagement_candidates[2]['value']
+        debug_info['parse_strategies_tried'].append(f'v2_grouped:L{result["likes"]}/C{result["comments"]}/S{result["shares"]}')
+    elif len(engagement_candidates) == 2 and result['likes'] == 0:
+        result['likes'] = engagement_candidates[0]['value']
+        result['comments'] = engagement_candidates[1]['value']
+        debug_info['parse_strategies_tried'].append(f'v2_grouped_2nums')
+    elif len(engagement_candidates) == 1 and result['likes'] == 0:
+        result['likes'] = engagement_candidates[0]['value']
+        debug_info['parse_strategies_tried'].append(f'v2_grouped_1num')
+    
+    # ============================================
+    # STRATEGY VIEW_FROM_LARGE_NUMBER:
+    # If found a number with K/M suffix (like 1.3K, 17K), it's likely VIEWS
+    # ============================================
+    if result['views'] == 0:
+        for n in numbers_found:
+            # Numbers like 1.3K, 17K, 1.5M are usually views
+            if 'K' in n['raw'].upper() or 'M' in n['raw'].upper() or 'tri\u1ec7u' in n['raw']:
+                if n['value'] >= 1000:  # at least 1K
+                    if n['value'] > result['views']:
+                        result['views'] = n['value']
+                        debug_info['parse_strategies_tried'].append(f'large_number_view:{n["value"]}')
+    
+    return result
+
+
+def simulate_human(page):
+    try:
+        for _ in range(2):
+            x = random.randint(100, 1200)
+            y = random.randint(100, 600)
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.3, 0.5))
+        for offset in [200, 500]:
+            page.evaluate(f'window.scrollTo({{top: {offset}, behavior: "smooth"}})')
+            time.sleep(random.uniform(0.6, 1.0))
+    except:
+        pass
 
 
 def search_views_in_text(text):
-    """Search Vietnamese view patterns + JSON patterns in any text"""
+    """Search Vietnamese view patterns + JSON patterns"""
     candidates = []
     
     patterns = [
@@ -196,6 +309,8 @@ def search_views_in_text(text):
         r'"viewCount"\s*:\s*(\d+)',
         r'"reels_view_count"\s*:\s*(\d+)',
         r'"organic_view_count"\s*:\s*(\d+)',
+        r'"post_view_count"\s*:\s*(\d+)',
+        r'"feedback_video_view_count"\s*:\s*(\d+)',
     ]
     
     for pat in json_patterns:
@@ -209,274 +324,6 @@ def search_views_in_text(text):
                 pass
     
     return max(candidates) if candidates else 0
-
-
-def simulate_human(page):
-    try:
-        for _ in range(2):
-            x = random.randint(100, 1200)
-            y = random.randint(100, 600)
-            page.mouse.move(x, y)
-            time.sleep(random.uniform(0.3, 0.5))
-        for offset in [200, 500]:
-            page.evaluate(f'window.scrollTo({{top: {offset}, behavior: "smooth"}})')
-            time.sleep(random.uniform(0.6, 1.0))
-    except:
-        pass
-
-
-# ==========================================
-# FINGERPRINTS - 3 different realistic profiles
-# ==========================================
-
-FINGERPRINT_IPHONE_15 = {
-    'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
-    'viewport': {'width': 393, 'height': 852},
-    'device_scale_factor': 3,
-    'is_mobile': True,
-    'has_touch': True,
-    'extra_headers': {
-        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': 'https://www.google.com/',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'cross-site',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
-    }
-}
-
-FINGERPRINT_ANDROID_S24 = {
-    'user_agent': 'Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-    'viewport': {'width': 384, 'height': 834},
-    'device_scale_factor': 2.75,
-    'is_mobile': True,
-    'has_touch': True,
-    'extra_headers': {
-        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Referer': 'https://www.google.com/search?q=facebook+reel',
-        'sec-ch-ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-        'sec-ch-ua-mobile': '?1',
-        'sec-ch-ua-platform': '"Android"',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'cross-site',
-        'Upgrade-Insecure-Requests': '1',
-    }
-}
-
-FINGERPRINT_DESKTOP_CHROME_VN = {
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'viewport': {'width': 1366, 'height': 768},
-    'device_scale_factor': 1,
-    'is_mobile': False,
-    'has_touch': False,
-    'extra_headers': {
-        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Referer': 'https://www.google.com.vn/',
-        'sec-ch-ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'cross-site',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
-    }
-}
-
-
-def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
-    """
-    Try to scrape views WITHOUT cookies but with realistic fingerprint.
-    The key insight: Different fingerprints might bypass FB's anti-bot.
-    """
-    try:
-        debug_info[f'{name}_attempted'] = True
-        
-        context = browser.new_context(
-            user_agent=fingerprint['user_agent'],
-            viewport=fingerprint['viewport'],
-            device_scale_factor=fingerprint['device_scale_factor'],
-            is_mobile=fingerprint['is_mobile'],
-            has_touch=fingerprint['has_touch'],
-            locale='vi-VN',
-            timezone_id='Asia/Ho_Chi_Minh',
-            extra_http_headers=fingerprint['extra_headers'],
-        )
-        
-        # NO cookies - anonymous
-        page = context.new_page()
-        
-        # Anti-detection scripts
-        page.add_init_script("""
-            // Override webdriver detection
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
-            
-            // Fake chrome runtime
-            window.chrome = { runtime: {} };
-            
-            // Hide playwright trace
-            const originalQuery = window.navigator.permissions?.query;
-            if (originalQuery) {
-                window.navigator.permissions.query = (params) => (
-                    params.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission })
-                        : originalQuery(params)
-                );
-            }
-            
-            // Pretend to have screen
-            Object.defineProperty(screen, 'availWidth', { get: () => 1366 });
-            Object.defineProperty(screen, 'availHeight', { get: () => 768 });
-        """)
-        
-        # Capture all responses
-        captured_responses = []
-        def handle_response(response):
-            try:
-                if response.status == 200:
-                    url_lower = response.url.lower()
-                    if any(k in url_lower for k in ['graphql', 'reel', 'video', 'fb_dtsg', 'jsmods']):
-                        try:
-                            body = response.text()
-                            if body and len(body) < 3000000:
-                                captured_responses.append(body)
-                        except:
-                            pass
-            except:
-                pass
-        page.on('response', handle_response)
-        
-        logger.info(f'{name} navigating to: {url}')
-        response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
-        
-        # Random wait like real user (3-7s)
-        time.sleep(random.uniform(3, 6))
-        
-        # Try to dismiss login overlay if appears (without dismissing video)
-        try:
-            page.evaluate("""
-                () => {
-                    // Find and remove login modals (but keep page visible)
-                    const dialogs = document.querySelectorAll('[role="dialog"]');
-                    dialogs.forEach(d => {
-                        const text = d.textContent || '';
-                        if (text.includes('Đăng nhập') || text.includes('Log in')) {
-                            d.style.display = 'none';
-                        }
-                    });
-                    // Remove overlays
-                    const overlays = document.querySelectorAll('[data-testid*="login"], [aria-label*="Đăng nhập"]');
-                    overlays.forEach(o => o.style.display = 'none');
-                }
-            """)
-            time.sleep(1)
-        except:
-            pass
-        
-        # Scroll to trigger view counter render
-        try:
-            page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
-            time.sleep(2)
-            page.evaluate('window.scrollTo({top: 600, behavior: "smooth"})')
-            time.sleep(2)
-        except:
-            pass
-        
-        # Get all data
-        html = page.content()
-        innertext = ''
-        try:
-            innertext = page.evaluate('document.body.innerText || ""')
-        except:
-            pass
-        
-        debug_info[f'{name}_html_length'] = len(html)
-        debug_info[f'{name}_innertext_length'] = len(innertext)
-        debug_info[f'{name}_innertext_preview'] = innertext[:300]
-        debug_info[f'{name}_network_count'] = len(captured_responses)
-        debug_info[f'{name}_url_after_redirect'] = page.url
-        
-        # Check if redirected to login
-        if 'login' in page.url.lower() or 'Đăng nhập vào Facebook' in innertext[:200]:
-            debug_info[f'{name}_blocked'] = True
-            context.close()
-            return 0
-        
-        # Search views in all sources
-        all_text = '\n'.join([html, innertext] + captured_responses)
-        views = search_views_in_text(all_text)
-        
-        debug_info[f'{name}_views_found'] = views
-        debug_info[f'{name}_html_keywords'] = {
-            'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
-            'has_video_view_count': 'video_view_count' in html,
-            'has_play_count': 'play_count' in html,
-        }
-        
-        context.close()
-        return views
-    except Exception as e:
-        logger.warning(f'{name} mode failed: {e}')
-        debug_info[f'{name}_error'] = str(e)[:200]
-        return 0
-
-
-def try_mbasic_for_views(browser, url, cookies, debug_info):
-    """
-    NEW MODE: mbasic.facebook.com - text-only mobile site.
-    Sometimes shows view counter that desktop/mobile hides.
-    """
-    try:
-        debug_info['mbasic_attempted'] = True
-        
-        # Convert URL to mbasic
-        mbasic_url = url.replace('www.facebook.com', 'mbasic.facebook.com')
-        if 'mbasic.facebook.com' not in mbasic_url:
-            mbasic_url = mbasic_url.replace('facebook.com', 'mbasic.facebook.com')
-        
-        context = browser.new_context(
-            user_agent='Mozilla/5.0 (Linux; Android 7.0; SM-G930V) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.125 Mobile Safari/537.36',
-            viewport={'width': 360, 'height': 640},
-            locale='vi-VN',
-            timezone_id='Asia/Ho_Chi_Minh',
-        )
-        
-        context.add_cookies(cookies)
-        page = context.new_page()
-        
-        logger.info(f'mbasic navigating to: {mbasic_url}')
-        response = page.goto(mbasic_url, wait_until='domcontentloaded', timeout=30000)
-        time.sleep(4)
-        
-        html = page.content()
-        innertext = ''
-        try:
-            innertext = page.evaluate('document.body.innerText || ""')
-        except:
-            pass
-        
-        debug_info['mbasic_html_length'] = len(html)
-        debug_info['mbasic_innertext_length'] = len(innertext)
-        debug_info['mbasic_innertext_preview'] = innertext[:500]
-        
-        all_text = html + '\n' + innertext
-        views = search_views_in_text(all_text)
-        debug_info['mbasic_views_found'] = views
-        
-        context.close()
-        return views
-    except Exception as e:
-        logger.warning(f'mbasic mode failed: {e}')
-        debug_info['mbasic_error'] = str(e)[:200]
-        return 0
 
 
 def scrape_with_playwright(url):
@@ -498,6 +345,7 @@ def scrape_with_playwright(url):
             'mode_used': '',
             'tried_modes': [],
             'view_sources': {},
+            'parse_v82_debug': {},
         }
     }
     
@@ -516,35 +364,12 @@ def scrape_with_playwright(url):
                 ]
             )
             
-            # === ATTEMPT 1: Desktop with cookies (engagement + metadata) ===
-            views_1 = try_desktop_with_cookies(browser, url, cookies, result)
-            result['debug']['view_sources']['desktop_cookies'] = views_1
+            views_desktop = try_desktop_with_cookies(browser, url, cookies, result)
+            result['debug']['view_sources']['desktop_cookies'] = views_desktop
             
-            # === ATTEMPT 2: iPhone 15 anonymous (NEW) ===
-            views_2 = try_anonymous_with_fingerprint(
-                browser, url, FINGERPRINT_IPHONE_15, 'iphone15', result['debug']
-            )
-            result['debug']['view_sources']['iphone15_anon'] = views_2
-            
-            # === ATTEMPT 3: Android S24 anonymous (NEW) ===
-            views_3 = try_anonymous_with_fingerprint(
-                browser, url, FINGERPRINT_ANDROID_S24, 'android', result['debug']
-            )
-            result['debug']['view_sources']['android_anon'] = views_3
-            
-            # === ATTEMPT 4: mbasic.facebook.com text-only (NEW) ===
-            views_4 = try_mbasic_for_views(browser, url, cookies, result['debug'])
-            result['debug']['view_sources']['mbasic_cookies'] = views_4
-            
-            # === ATTEMPT 5: Mobile m.facebook.com (engagement backup) ===
-            try_mobile_mode(browser, url, cookies, result)
+            try_mobile_mode_v82(browser, url, cookies, result)
             
             browser.close()
-            
-            # COMBINE: Take MAX views from all sources
-            final_views = max(views_1, views_2, views_3, views_4)
-            if final_views > 0:
-                result['data']['views'] = final_views
             
             if (result['data']['views'] > 0 or 
                 result['data']['likes'] > 0 or
@@ -559,7 +384,7 @@ def scrape_with_playwright(url):
 
 
 def try_desktop_with_cookies(browser, url, cookies, result):
-    """Mode 1: Desktop with cookies for engagement + metadata"""
+    """Desktop with cookies for engagement + metadata"""
     try:
         result['debug']['tried_modes'].append('desktop_cookies')
         
@@ -630,10 +455,10 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         return 0
 
 
-def try_mobile_mode(browser, url, cookies, result):
-    """Mode 5: Mobile m.facebook.com for engagement"""
+def try_mobile_mode_v82(browser, url, cookies, result):
+    """V8.2 Mobile mode with smart parsing"""
     try:
-        result['debug']['tried_modes'].append('mobile_cookies')
+        result['debug']['tried_modes'].append('mobile_v82')
         
         mobile_url = url.replace('www.facebook.com', 'm.facebook.com')
         if 'm.facebook.com' not in mobile_url:
@@ -668,30 +493,34 @@ def try_mobile_mode(browser, url, cookies, result):
         try:
             mobile_innertext = page.evaluate('document.body.innerText || ""')
             result['debug']['mobile_innertext_length'] = len(mobile_innertext)
-            result['debug']['mobile_innertext_sample'] = mobile_innertext[:1000]
+            result['debug']['mobile_innertext_sample'] = mobile_innertext[:1500]
         except:
             pass
         
-        engagement = parse_mobile_engagement(mobile_innertext, result['debug'])
+        # V8.2: Use new flexible parser
+        parsed = parse_mobile_engagement_v82(mobile_innertext, result['debug']['parse_v82_debug'])
         
-        if engagement.get('likes', 0) > 0:
-            result['data']['likes'] = engagement['likes']
-        if engagement.get('comments', 0) > 0:
-            result['data']['comments'] = engagement['comments']
-        if engagement.get('shares', 0) > 0:
-            result['data']['shares'] = engagement['shares']
+        if parsed.get('likes', 0) > 0:
+            result['data']['likes'] = parsed['likes']
+        if parsed.get('comments', 0) > 0:
+            result['data']['comments'] = parsed['comments']
+        if parsed.get('shares', 0) > 0:
+            result['data']['shares'] = parsed['shares']
+        if parsed.get('views', 0) > 0:
+            result['data']['views'] = parsed['views']
+            result['debug']['view_sources']['mobile_v82'] = parsed['views']
         
-        # Mobile innertext might also have views
-        if mobile_innertext:
-            mobile_views = search_views_in_text(mobile_innertext)
-            if mobile_views > 0:
-                result['debug']['view_sources']['mobile_cookies'] = mobile_views
-                if mobile_views > result['data']['views']:
-                    result['data']['views'] = mobile_views
+        # Also search HTML for views (some videos have view in HTML)
+        if result['data']['views'] == 0:
+            mobile_html = page.content()
+            html_views = search_views_in_text(mobile_html)
+            if html_views > 0:
+                result['data']['views'] = html_views
+                result['debug']['view_sources']['mobile_html'] = html_views
         
         context.close()
     except Exception as e:
-        logger.warning(f'Mobile mode failed: {e}')
+        logger.warning(f'Mobile v82 mode failed: {e}')
 
 
 def extract_username_from_dom(page):
@@ -775,7 +604,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.1-multi-fingerprint',
+        'version': '8.2-flexible-parser',
     })
 
 
@@ -799,7 +628,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.1-multi-fingerprint',
+        'version': '8.2-flexible-parser',
     })
 
 
