@@ -1,21 +1,28 @@
 """
-Rise City Facebook Scraper API - V8.2 🎩
-ROOT CAUSE FIX: FB render engagement icons differently based on count.
+Rise City Facebook Scraper API - V8.3 🎩
+ROOT CAUSE FIX: Map icon→field by Unicode codepoint, NOT pattern matching.
 
 Discovery:
-- Video with HIGH engagement (>10): "icon\n99\nicon\n50\nicon\n2"
-- Video with LOW engagement (<10): "icon\nicon\n6\nicon\n11" (icons grouped first, numbers after)
-- Some videos: Numbers before icons
-- Live indicator (eye icon 󱝍) shows view count separately
+- U+F0378 (󰍸) = Like icon
+- U+F0379 (󰍹) = Comment icon
+- U+F037A (󰍺) = Share icon
+- U+F174D (󱝍) = Eye icon (view)
 
-Solution: Multiple parsing strategies, smart fallback, take first valid match.
+When engagement = 0, FB shows ICON without number!
+Pattern parsing fails because:
+  󰍸\n󰍹\n6\n󰍺  ← like icon, comment icon, "6" (comments), share icon
+  
+V7.8/V8.1 takes [6, 11, 1] as [likes, comments, shares] but actually:
+- "6" = comments of reel 1
+- "11" = LIKES of reel 2 (different video!)
+- "1" = comments of reel 2
 
-Strategies:
-1. Strategy ICON_NUMBER: icon → number (V7.8 logic, works for normal videos)
-2. Strategy ICON_GROUPED: icons grouped, numbers grouped (NEW - low engagement)
-3. Strategy NUMBER_ICON: number → icon (NEW - reversed order)
-4. Strategy EYE_ICON_VIEW: eye icon 󱝍 → view count (NEW for view extraction)
-5. Strategy FALLBACK: Find any 3 numbers in mobile innertext that look like engagement
+V8.3 Strategy:
+1. Find FIRST occurrence of each icon
+2. Number AFTER icon = value for that field
+3. If NO number after icon → field = 0
+4. Block boundary: when icon SEQUENCE restarts (icon already seen) → next reel
+5. Eye icon has different parsing
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -33,6 +40,12 @@ app = Flask(__name__)
 
 COOKIES_PATH = os.getenv('FB_COOKIES_PATH', '/etc/secrets/cookies.txt')
 API_SECRET = os.getenv('API_SECRET', 'rise-city-secret-2026')
+
+# FB private use area icons
+ICON_LIKE = '\U000F0378'      # 󰍸
+ICON_COMMENT = '\U000F0379'   # 󰍹
+ICON_SHARE = '\U000F037A'     # 󰍺
+ICON_EYE = '\U000F174D'       # 󱝍 (view count)
 
 USERNAME_BLACKLIST = {
     'recover', 'help', 'settings', 'privacy', 'home', 'login', 'logout',
@@ -113,6 +126,18 @@ def parse_vietnamese_number(text):
     if not text:
         return 0
     s = str(text).strip()
+    
+    # Handle "X triệu" format
+    if 'tri\u1ec7u' in s:
+        # "1,3 triệu" -> 1.3 * 1M = 1,300,000
+        num_match = re.match(r'([\d.,]+)', s)
+        if num_match:
+            num_str = num_match.group(1).replace(',', '.')
+            try:
+                return int(float(num_str) * 1000000)
+            except:
+                return 0
+    
     match = re.match(r'([\d.,]+)\s*([KkMmBbTrtr]+)?', s)
     if not match:
         return 0
@@ -150,123 +175,205 @@ def parse_vietnamese_number(text):
     return int(num)
 
 
-def parse_mobile_engagement_v82(innertext, debug_info):
+def parse_engagement_v83(innertext, debug_info):
     """
-    V8.2: Multiple parsing strategies for FB rendering variations.
-    Returns engagement dict + view dict.
+    V8.3: Icon-specific parsing.
+    
+    Strategy:
+    1. Tokenize innertext into icons and numbers (with positions)
+    2. Walk through tokens, identifying "blocks" (each reel)
+    3. Take FIRST block's icons (the target video)
+    4. For each icon, get number that follows IMMEDIATELY
+    5. If next token is another ICON (not number), the value = 0
     """
     result = {'likes': 0, 'comments': 0, 'shares': 0, 'views': 0}
     
     if not innertext:
         return result
     
-    debug_info['parse_strategies_tried'] = []
-    
-    # Get only the FIRST video block (not the entire reels feed)
-    # Look for first sequence of icon→...→author pattern
-    # The first reel should be at the start before "Watch more reels"
-    first_block = innertext
-    if 'Watch more reels' in innertext:
-        first_block = innertext.split('Watch more reels')[0]
-    elif 'Hãy đăng nhập' in innertext:
-        first_block = innertext.split('Hãy đăng nhập')[0]
-    
-    debug_info['first_block_length'] = len(first_block)
-    debug_info['first_block_sample'] = first_block[:600]
+    debug_info['parse_v83'] = {'tokens': [], 'blocks': []}
     
     # ============================================
-    # STRATEGY EYE_ICON: Find 󱝍 (eye) → view count
-    # The eye icon often shows view count for reels
+    # STEP 1: Tokenize innertext
     # ============================================
-    eye_icon = '\U000F174D'  # 󱝍 unicode
-    eye_pattern = rf'{re.escape(eye_icon)}\s*\n?\s*([\d.,]+\s*[KkMmBb]?(?:\s*tri\u1ec7u)?)'
-    eye_matches = re.findall(eye_pattern, first_block)
-    if eye_matches:
-        for match in eye_matches[:5]:
-            view_value = parse_vietnamese_number(match)
-            # Eye icon usually for VIEWS not engagement, so accept reasonable view counts
-            if 100 <= view_value <= 1000000000:
-                if view_value > result['views']:
-                    result['views'] = view_value
-                    debug_info['parse_strategies_tried'].append(f'eye_icon_view:{view_value}')
+    # Each line, classify as: icon, number, or text
+    lines = innertext.split('\n')
+    tokens = []
     
-    # ============================================
-    # STRATEGY ICON_NUMBER (V7.8): icon → number directly
-    # Works for: "󰍸\n99\n󰍹\n50\n󰍺\n2"
-    # ============================================
-    pattern_v1 = r'[\U000F0000-\U000FFFFD]\s*\n\s*([\d.,]+\s*[KkMmBb]?)\s*\n'
-    matches_v1 = re.findall(pattern_v1, first_block)
-    debug_info['strategy_v1_matches'] = matches_v1[:5]
-    
-    if len(matches_v1) >= 3:
-        # First 3 matches are usually likes, comments, shares
-        result['likes'] = parse_vietnamese_number(matches_v1[0])
-        result['comments'] = parse_vietnamese_number(matches_v1[1])
-        result['shares'] = parse_vietnamese_number(matches_v1[2])
-        debug_info['parse_strategies_tried'].append(f'v1_icon_number:L{result["likes"]}/C{result["comments"]}/S{result["shares"]}')
-        return result
-    
-    # ============================================
-    # STRATEGY ICON_GROUPED: icons grouped, numbers separate
-    # Works for: "󰍸\n󰍹\n6\n󰍺\n11" (some icons appear without numbers)
-    # ============================================
-    # Find sequence: icon, optional newline, icon, optional newline, NUMBER, icon, NUMBER
-    # Or any combination where icons are grouped before numbers
-    
-    # Split into lines and analyze
-    lines = first_block.split('\n')
-    debug_info['total_lines'] = len(lines)
-    
-    # Find first 5 numbers in order they appear
-    numbers_found = []
     for i, line in enumerate(lines):
-        line_clean = line.strip()
-        if not line_clean:
+        line_stripped = line.strip()
+        if not line_stripped:
             continue
-        # Check if line is a number (with optional K/M suffix)
-        num_match = re.match(r'^([\d.,]+\s*[KkMmBb]?(?:\s*tri\u1ec7u)?)$', line_clean)
+        
+        # Check if line is a number FIRST (before icon check)
+        # because numbers like "6" also have len=1
+        num_match = re.match(r'^([\d.,]+\s*[KkMmBb]?(?:\s*tri\u1ec7u)?)$', line_stripped)
         if num_match:
             value = parse_vietnamese_number(num_match.group(1))
-            if 0 <= value <= 1000000000:
-                numbers_found.append({
-                    'value': value,
-                    'line_idx': i,
-                    'raw': line_clean
-                })
-                if len(numbers_found) >= 10:
+            tokens.append({
+                'type': 'number',
+                'value': value,
+                'raw': line_stripped,
+                'line': i,
+            })
+            continue
+        
+        # Check if line is single icon (after number check)
+        if len(line_stripped) <= 2:
+            for ch in line_stripped:
+                cp = ord(ch)
+                if 0xF0000 <= cp <= 0xFFFFD:
+                    icon_type = None
+                    if ch == ICON_LIKE:
+                        icon_type = 'like'
+                    elif ch == ICON_COMMENT:
+                        icon_type = 'comment'
+                    elif ch == ICON_SHARE:
+                        icon_type = 'share'
+                    elif ch == ICON_EYE:
+                        icon_type = 'eye'
+                    else:
+                        icon_type = 'other_icon'
+                    
+                    tokens.append({
+                        'type': 'icon',
+                        'icon_type': icon_type,
+                        'raw': ch,
+                        'codepoint': f'U+{cp:05X}',
+                        'line': i,
+                    })
                     break
+            continue
+        
+        # Otherwise it's text
+        tokens.append({
+            'type': 'text',
+            'raw': line_stripped[:50],
+            'line': i,
+        })
     
-    debug_info['numbers_found'] = [n['raw'] for n in numbers_found[:10]]
-    
-    # Strategy v2: Take first 3 numbers as engagement (most common case for low-engagement)
-    # Filter out numbers that are too large (likely view counts, not engagement)
-    engagement_candidates = [n for n in numbers_found if n['value'] < 1000000]
-    
-    if len(engagement_candidates) >= 3 and result['likes'] == 0:
-        result['likes'] = engagement_candidates[0]['value']
-        result['comments'] = engagement_candidates[1]['value']
-        result['shares'] = engagement_candidates[2]['value']
-        debug_info['parse_strategies_tried'].append(f'v2_grouped:L{result["likes"]}/C{result["comments"]}/S{result["shares"]}')
-    elif len(engagement_candidates) == 2 and result['likes'] == 0:
-        result['likes'] = engagement_candidates[0]['value']
-        result['comments'] = engagement_candidates[1]['value']
-        debug_info['parse_strategies_tried'].append(f'v2_grouped_2nums')
-    elif len(engagement_candidates) == 1 and result['likes'] == 0:
-        result['likes'] = engagement_candidates[0]['value']
-        debug_info['parse_strategies_tried'].append(f'v2_grouped_1num')
+    debug_info['parse_v83']['tokens_count'] = len(tokens)
+    debug_info['parse_v83']['tokens_first_30'] = [
+        {'t': t['type'], 'r': t.get('icon_type', '') or t.get('raw', '')[:30] or str(t.get('value', ''))}
+        for t in tokens[:30]
+    ]
     
     # ============================================
-    # STRATEGY VIEW_FROM_LARGE_NUMBER:
-    # If found a number with K/M suffix (like 1.3K, 17K), it's likely VIEWS
+    # STEP 2: Find FIRST reel block
+    # A reel block starts with first like/comment/share icon
+    # Block ends when we see another like icon (next reel) OR text "Watch more"
     # ============================================
-    if result['views'] == 0:
-        for n in numbers_found:
-            # Numbers like 1.3K, 17K, 1.5M are usually views
-            if 'K' in n['raw'].upper() or 'M' in n['raw'].upper() or 'tri\u1ec7u' in n['raw']:
-                if n['value'] >= 1000:  # at least 1K
-                    if n['value'] > result['views']:
-                        result['views'] = n['value']
-                        debug_info['parse_strategies_tried'].append(f'large_number_view:{n["value"]}')
+    
+    first_reel_tokens = []
+    seen_like = False
+    seen_share = False
+    
+    for tok in tokens:
+        # Stop conditions
+        if tok['type'] == 'text':
+            text = tok['raw'].lower()
+            if 'watch more' in text or 'kh\u00e1m ph\u00e1' in text or 'tr\u1ed1ng' in text:
+                break
+        
+        # If we already have likes+comments+shares of reel 1, stop
+        if tok['type'] == 'icon' and tok.get('icon_type') == 'like' and seen_like and seen_share:
+            # This is start of reel 2
+            break
+        
+        if tok['type'] == 'icon' and tok.get('icon_type') == 'like':
+            seen_like = True
+        if tok['type'] == 'icon' and tok.get('icon_type') == 'share':
+            seen_share = True
+        
+        first_reel_tokens.append(tok)
+    
+    debug_info['parse_v83']['first_reel_tokens_count'] = len(first_reel_tokens)
+    debug_info['parse_v83']['first_reel_summary'] = [
+        f"{t['type']}:{t.get('icon_type', '') or t.get('value', '') or t.get('raw', '')[:20]}"
+        for t in first_reel_tokens
+    ]
+    
+    # ============================================
+    # STEP 3: Smart mapping - icon followed by number assigns to that icon
+    # When icon followed by ANOTHER icon, that field = 0 (FB hides 0 values)
+    # ============================================
+    
+    # First, identify positions of each icon type
+    icon_positions = {'like': [], 'comment': [], 'share': [], 'eye': []}
+    for i, tok in enumerate(first_reel_tokens):
+        if tok['type'] == 'icon':
+            it = tok.get('icon_type')
+            if it in icon_positions:
+                icon_positions[it].append(i)
+    
+    debug_info['parse_v83']['icon_positions'] = icon_positions
+    
+    # Map icon -> number that follows directly
+    for icon_type in ['like', 'comment', 'share', 'eye']:
+        if not icon_positions[icon_type]:
+            continue
+        
+        idx = icon_positions[icon_type][0]  # First occurrence
+        
+        # Look at next token
+        if idx + 1 < len(first_reel_tokens):
+            next_tok = first_reel_tokens[idx + 1]
+            if next_tok['type'] == 'number':
+                value = next_tok['value']
+                if icon_type == 'like' and 0 <= value < 1000000000:
+                    result['likes'] = value
+                elif icon_type == 'comment' and 0 <= value < 1000000000:
+                    result['comments'] = value
+                elif icon_type == 'share' and 0 <= value < 1000000000:
+                    result['shares'] = value
+                elif icon_type == 'eye' and 0 <= value < 10000000000:
+                    result['views'] = value
+    
+    # SPECIAL CASE: Icons grouped without numbers, then numbers come later
+    # Pattern: icon_like, icon_comment, NUMBER(N1), icon_share
+    # → likes=0, comments=N1, shares=0 (because share has no number after)
+    
+    # If all 3 main icons are 0 but we have numbers in tokens, try grouped pattern
+    if (result['likes'] == 0 and result['comments'] == 0 and result['shares'] == 0):
+        # Find all icons in order, then all numbers in order in first block
+        icons_seq = []
+        numbers_seq = []
+        for tok in first_reel_tokens:
+            if tok['type'] == 'icon' and tok.get('icon_type') in ('like', 'comment', 'share'):
+                icons_seq.append(tok.get('icon_type'))
+            elif tok['type'] == 'number' and 0 <= tok['value'] < 1000000000:
+                numbers_seq.append(tok['value'])
+        
+        debug_info['parse_v83']['grouped_icons'] = icons_seq
+        debug_info['parse_v83']['grouped_numbers'] = numbers_seq
+        
+        # If we have 1-3 numbers and exactly 3 icons (like, comment, share)
+        if icons_seq == ['like', 'comment', 'share'] or icons_seq[:3] == ['like', 'comment', 'share']:
+            # FB hides numbers for 0 values
+            if len(numbers_seq) == 3:
+                result['likes'] = numbers_seq[0]
+                result['comments'] = numbers_seq[1]
+                result['shares'] = numbers_seq[2]
+            elif len(numbers_seq) == 2:
+                # Likes=0 hidden, take 2 numbers as comments+shares
+                result['likes'] = 0
+                result['comments'] = numbers_seq[0]
+                result['shares'] = numbers_seq[1]
+            elif len(numbers_seq) == 1:
+                # Only 1 number visible → assign to comments
+                result['likes'] = 0
+                result['comments'] = numbers_seq[0]
+                result['shares'] = 0
+    
+    debug_info['parse_v83']['parsed_result'] = result.copy()
+    
+    # ============================================
+    # STEP 4: Eye icon view count - ONLY from first reel block
+    # Don't use eye icons from "Watch more reels" section (other reels)
+    # ============================================
+    # Already handled in STEP 3 via icon_positions['eye']
+    # If eye icon is NOT in first_reel_tokens, views stays 0
+    # (We do NOT fall back to other reels' view counts)
     
     return result
 
@@ -345,7 +452,6 @@ def scrape_with_playwright(url):
             'mode_used': '',
             'tried_modes': [],
             'view_sources': {},
-            'parse_v82_debug': {},
         }
     }
     
@@ -367,12 +473,13 @@ def scrape_with_playwright(url):
             views_desktop = try_desktop_with_cookies(browser, url, cookies, result)
             result['debug']['view_sources']['desktop_cookies'] = views_desktop
             
-            try_mobile_mode_v82(browser, url, cookies, result)
+            try_mobile_mode_v83(browser, url, cookies, result)
             
             browser.close()
             
             if (result['data']['views'] > 0 or 
                 result['data']['likes'] > 0 or
+                result['data']['comments'] > 0 or
                 result['data']['caption']):
                 result['success'] = True
     except Exception as e:
@@ -384,7 +491,7 @@ def scrape_with_playwright(url):
 
 
 def try_desktop_with_cookies(browser, url, cookies, result):
-    """Desktop with cookies for engagement + metadata"""
+    """Desktop with cookies for caption + metadata + sometimes views from HTML"""
     try:
         result['debug']['tried_modes'].append('desktop_cookies')
         
@@ -455,10 +562,10 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         return 0
 
 
-def try_mobile_mode_v82(browser, url, cookies, result):
-    """V8.2 Mobile mode with smart parsing"""
+def try_mobile_mode_v83(browser, url, cookies, result):
+    """V8.3 Mobile mode with icon-specific parsing"""
     try:
-        result['debug']['tried_modes'].append('mobile_v82')
+        result['debug']['tried_modes'].append('mobile_v83')
         
         mobile_url = url.replace('www.facebook.com', 'm.facebook.com')
         if 'm.facebook.com' not in mobile_url:
@@ -497,20 +604,18 @@ def try_mobile_mode_v82(browser, url, cookies, result):
         except:
             pass
         
-        # V8.2: Use new flexible parser
-        parsed = parse_mobile_engagement_v82(mobile_innertext, result['debug']['parse_v82_debug'])
+        # V8.3: Use icon-specific parser
+        parsed = parse_engagement_v83(mobile_innertext, result['debug'])
         
-        if parsed.get('likes', 0) > 0:
-            result['data']['likes'] = parsed['likes']
-        if parsed.get('comments', 0) > 0:
-            result['data']['comments'] = parsed['comments']
-        if parsed.get('shares', 0) > 0:
-            result['data']['shares'] = parsed['shares']
+        # Always set values from V8.3 (they may be 0 which is correct)
+        result['data']['likes'] = parsed.get('likes', 0)
+        result['data']['comments'] = parsed.get('comments', 0)
+        result['data']['shares'] = parsed.get('shares', 0)
         if parsed.get('views', 0) > 0:
             result['data']['views'] = parsed['views']
-            result['debug']['view_sources']['mobile_v82'] = parsed['views']
+            result['debug']['view_sources']['mobile_v83_eye'] = parsed['views']
         
-        # Also search HTML for views (some videos have view in HTML)
+        # Also search HTML for views as fallback
         if result['data']['views'] == 0:
             mobile_html = page.content()
             html_views = search_views_in_text(mobile_html)
@@ -520,7 +625,7 @@ def try_mobile_mode_v82(browser, url, cookies, result):
         
         context.close()
     except Exception as e:
-        logger.warning(f'Mobile v82 mode failed: {e}')
+        logger.warning(f'Mobile v83 mode failed: {e}')
 
 
 def extract_username_from_dom(page):
@@ -604,7 +709,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.2-flexible-parser',
+        'version': '8.3-icon-mapping',
     })
 
 
@@ -628,7 +733,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.2-flexible-parser',
+        'version': '8.3-icon-mapping',
     })
 
 
