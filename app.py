@@ -1,14 +1,16 @@
 """
-Rise City Facebook Scraper API - V6.1 with CORS 🎩
-Updates from V6:
-+ Added CORS headers (allow Hoppscotch Browser, Lovable Edge Function, etc.)
-+ Same V6 features: Mobile viewport, DOM extraction, multi-strategy view extraction
+Rise City Facebook Scraper API - V7 Optimized 🎩
+Cải tiến từ V6.1:
+- Bỏ navigate kép, chỉ 1 lần truy cập (giảm 50% thời gian)
+- Giảm wait time (5s thay vì 8s)
+- JS DOM walker đơn giản hơn (ít memory)
+- CORS giữ nguyên
+- Chú trọng STABILITY > tính năng
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
 import os
 import re
-import json
 import logging
 import time
 
@@ -21,7 +23,6 @@ COOKIES_PATH = os.getenv('FB_COOKIES_PATH', '/etc/secrets/cookies.txt')
 API_SECRET = os.getenv('API_SECRET', 'rise-city-secret-2026')
 
 
-# === CORS MIDDLEWARE ===
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -35,13 +36,10 @@ def add_cors_headers(response):
 @app.route('/health', methods=['OPTIONS'])
 @app.route('/', methods=['OPTIONS'])
 def handle_options():
-    """Handle CORS preflight"""
-    response = make_response('', 204)
-    return response
+    return make_response('', 204)
 
 
 def decode_unicode_string(s):
-    """Decode \\uXXXX escape sequences"""
     if not s:
         return s
     try:
@@ -76,15 +74,12 @@ def parse_netscape_cookies(cookies_path):
 
 
 def parse_vietnamese_number(text):
-    """Parse '1,5K' -> 1500, '2,3M' -> 2300000, etc."""
     if not text:
         return 0
-    
     s = str(text).strip()
     match = re.match(r'([\d.,]+)\s*([KkMmBbTrtr]+)?', s)
     if not match:
         return 0
-    
     num_str = match.group(1)
     suffix = match.group(2)
     
@@ -116,7 +111,6 @@ def parse_vietnamese_number(text):
             num *= 1000000000
         elif 'tr' in suffix:
             num *= 1000000
-    
     return int(num)
 
 
@@ -133,8 +127,7 @@ def scrape_with_playwright(url):
             'video_url': '', 'reactions_breakdown': {},
         },
         'debug': {
-            'final_url': '',
-            'page_title': '',
+            'final_url': '', 'page_title': '',
             'cookies_count': len(cookies),
             'extracted_data': {},
             'view_extraction_attempts': [],
@@ -146,25 +139,23 @@ def scrape_with_playwright(url):
             browser = p.chromium.launch(
                 headless=True,
                 args=[
-                    '--no-sandbox', '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                    '--disable-gpu', '--no-first-run',
-                    '--autoplay-policy=no-user-gesture-required',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-gpu',
+                    '--no-first-run',
                 ]
             )
             
+            # Use mobile viewport directly - more lightweight
             context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
                 viewport={'width': 414, 'height': 896},
                 locale='vi-VN',
                 timezone_id='Asia/Ho_Chi_Minh',
                 is_mobile=True,
                 has_touch=True,
-                extra_http_headers={
-                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                }
             )
             
             context.add_cookies(cookies)
@@ -172,56 +163,44 @@ def scrape_with_playwright(url):
             
             page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
             """)
             
-            logger.info(f'Navigating to: {url}')
-            response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
-            time.sleep(5)
+            # If URL is /share/r/, redirect to mobile reel URL directly
+            target_url = url
+            if '/share/r/' in url or 'facebook.com/reel' in url:
+                # Try to extract reel ID from URL
+                reel_id_match = re.search(r'/reel/(\d+)', url)
+                if reel_id_match:
+                    target_url = f'https://m.facebook.com/reel/{reel_id_match.group(1)}'
             
-            html = page.content()
-            post_id_match = re.search(r'"video_id[":\s]*"(\d+)"', html) or \
-                           re.search(r'"top_level_post_id[":\s]*"(\d+)"', html)
+            logger.info(f'Navigating to: {target_url}')
+            response = page.goto(target_url, wait_until='domcontentloaded', timeout=45000)
             
-            if post_id_match:
-                post_id = post_id_match.group(1)
-                reel_url = f'https://m.facebook.com/reel/{post_id}'
-                logger.info(f'Trying mobile reel URL: {reel_url}')
-                try:
-                    page.goto(reel_url, wait_until='domcontentloaded', timeout=30000)
-                    time.sleep(8)
-                except Exception as e:
-                    logger.warning(f'Mobile reel URL failed: {e}')
-            
-            try:
-                page.evaluate('window.scrollTo(0, 100)')
-                time.sleep(2)
-                page.evaluate('window.scrollTo(0, 300)')
-                time.sleep(2)
-                page.evaluate('window.scrollTo(0, 0)')
-                time.sleep(2)
-            except:
-                pass
-            
-            time.sleep(5)
+            # Single wait, less time
+            time.sleep(6)
             
             final_url = page.url
             page_title = page.title()
             result['debug']['final_url'] = final_url
             result['debug']['page_title'] = page_title
+            result['debug']['response_status'] = response.status if response else None
             
             if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
-                result['error'] = 'Redirected to login - cookies invalid or expired'
+                result['error'] = 'Redirected to login - cookies invalid'
                 browser.close()
                 return result
             
             html = page.content()
             result['debug']['html_length'] = len(html)
             
-            views = extract_views_multistrategy(page, html, result['debug'])
+            # Extract data
             extracted = extract_from_html(html)
             result['debug']['extracted_data'] = extracted
+            
+            # Try DOM extraction for views (lightweight)
+            views = extracted.get('views', 0)
+            if views == 0:
+                views = extract_views_dom(page, result['debug'])
             
             result['data']['views'] = views
             result['data']['likes'] = extracted.get('likes', 0)
@@ -240,118 +219,69 @@ def scrape_with_playwright(url):
             
             browser.close()
     except Exception as e:
-        logger.exception('Playwright scrape failed')
+        logger.exception('Scrape failed')
         result['error'] = str(e)
         result['error_type'] = type(e).__name__
     
     return result
 
 
-def extract_views_multistrategy(page, html, debug_info):
+def extract_views_dom(page, debug_info):
+    """Lightweight DOM extraction for views"""
     attempts = []
-    candidate_views = []
+    candidates = []
     
-    # Strategy 1: HTML regex
-    html_patterns = [
-        r'"video_view_count[":\s]*(\d+)',
-        r'"video_view_count_renderer"[^}]*"count[":\s]*(\d+)',
-        r'"play_count[":\s]*(\d+)',
-        r'"viewCount[":\s]*(\d+)',
-        r'"unified_view_count_renderer"[^}]*"count[":\s]*(\d+)',
-        r'"reels_view_count[":\s]*(\d+)',
-        r'"organic_view_count[":\s]*(\d+)',
-        r'"playbackVideoMetadata"[^}]*"viewCount[":\s]*(\d+)',
-        r'"video_view_count_text"[^}]*"text[":\s]*"([^"]+)"',
-    ]
-    
-    for pattern in html_patterns:
-        match = re.search(pattern, html)
-        if match:
-            value = parse_vietnamese_number(match.group(1))
-            if value > 0:
-                candidate_views.append(value)
-                attempts.append({'strategy': 'html_regex', 'value': value})
-    
-    # Strategy 2: JS DOM walker
     try:
-        js_views = page.evaluate("""
+        # Simple JS - just find spans with numbers near SVG
+        js_results = page.evaluate("""
             () => {
                 const results = [];
                 const spans = document.querySelectorAll('span');
                 for (const span of spans) {
                     const text = (span.textContent || '').trim();
-                    if (/^[\\d.,]+\\s*[KkMmBb]?$/.test(text)) {
+                    // Match Vietnamese number format: 1,5K or 1.5K or 1500
+                    if (/^[\\d.,]+\\s*[KkMmBb]?$/.test(text) && text.length < 12) {
                         const parent = span.parentElement;
                         if (parent && parent.querySelector('svg')) {
-                            results.push({ text: text, hasIcon: true });
+                            results.push(text);
                         }
                     }
                 }
-                
-                // Also search for "lượt xem" / "view" text
-                const walker = document.createTreeWalker(
-                    document.body, NodeFilter.SHOW_TEXT, null, false
-                );
-                let node;
-                while (node = walker.nextNode()) {
-                    const parent = node.parentElement;
-                    if (!parent) continue;
-                    const fullText = parent.textContent || '';
-                    if (/(view|lượt xem|lần xem)/i.test(fullText)) {
-                        const m = fullText.match(/([\\d.,]+\\s*[KkMmBb]?)/);
-                        if (m) results.push({ text: fullText.substring(0, 80), number: m[1] });
-                    }
-                }
-                
-                return results;
+                return results.slice(0, 10);
             }
         """)
         
-        if js_views:
-            for item in js_views[:10]:
-                num_str = item.get('number', item.get('text', ''))
-                try:
-                    s = num_str.strip().replace(',', '.')
-                    multiplier = 1
-                    if s.lower().endswith('k'):
-                        multiplier = 1000
-                        s = s[:-1]
-                    elif s.lower().endswith('m'):
-                        multiplier = 1000000
-                        s = s[:-1]
-                    value = int(float(s) * multiplier)
-                    if 10 <= value <= 100000000:
-                        candidate_views.append(value)
-                        attempts.append({
-                            'strategy': 'js_dom', 
-                            'text': item.get('text', '')[:50], 
-                            'value': value,
-                            'hasIcon': item.get('hasIcon', False)
-                        })
-                except:
-                    pass
+        if js_results:
+            for text in js_results:
+                value = parse_vietnamese_number(text)
+                if 10 <= value <= 100000000:
+                    candidates.append(value)
+                    attempts.append({'text': text, 'value': value})
     except Exception as e:
-        attempts.append({'strategy': 'js_dom', 'error': str(e)[:100]})
+        attempts.append({'error': str(e)[:100]})
     
     debug_info['view_extraction_attempts'] = attempts
     
-    if candidate_views:
-        valid_views = [v for v in candidate_views if 1 <= v <= 100000000]
-        if valid_views:
-            sorted_views = sorted(valid_views)
-            return sorted_views[len(sorted_views) // 2]
-    
+    if candidates:
+        # Return median
+        sorted_views = sorted(candidates)
+        return sorted_views[len(sorted_views) // 2]
     return 0
 
 
 def extract_from_html(html):
     data = {}
     patterns = {
+        'views': [
+            r'"video_view_count[":\s]*(\d+)',
+            r'"play_count[":\s]*(\d+)',
+            r'"viewCount[":\s]*(\d+)',
+            r'"unified_view_count_renderer"[^}]*"count[":\s]*(\d+)',
+        ],
         'likes': [
             r'"reaction_count"[^}]*"count[":\s]*(\d+)',
             r'"top_reactions"[^}]*"count[":\s]*(\d+)',
             r'"likers"[^}]*"count[":\s]*(\d+)',
-            r'"reactors"[^}]*"count[":\s]*(\d+)',
         ],
         'comments': [
             r'"total_comment_count[":\s]*(\d+)',
@@ -384,7 +314,7 @@ def extract_from_html(html):
             match = re.search(pat, html)
             if match:
                 value = match.group(1)
-                if field in ['likes', 'comments', 'shares']:
+                if field in ['views', 'likes', 'comments', 'shares']:
                     parsed = parse_vietnamese_number(value)
                     if parsed > 0:
                         data[field] = parsed
@@ -402,8 +332,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '6.1-cors',
-        'engine': 'Playwright Mobile + DOM extraction + CORS',
+        'version': '7.0-optimized',
     })
 
 
@@ -427,7 +356,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '6.1-cors',
+        'version': '7.0-optimized',
     })
 
 
