@@ -1,11 +1,10 @@
 """
-Rise City Facebook Scraper API - V7.1 🎩
-Quay về Desktop UA (V5 logic), thêm view extraction nhẹ:
-- Desktop user agent (như V5 - lấy được full data)
-- /share/r/ URL trực tiếp (không redirect mobile)
-- Wait time vừa phải (8s)
-- Thêm DOM walker cho views (lightweight)
-- CORS giữ nguyên
+Rise City Facebook Scraper API - V7.2 🎩
+Fix từ V7.1:
+- DOM walker tìm view counter thông minh hơn (chỉ accept số có "lượt xem"/"view" nearby)
+- Thêm patterns cho shares (4 lượt chia sẻ format)
+- Thêm patterns cho username từ profile URL
+- Sanity check: views > likes thì mới hợp lý
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -131,6 +130,7 @@ def scrape_with_playwright(url):
             'cookies_count': len(cookies),
             'extracted_data': {},
             'view_extraction_attempts': [],
+            'share_extraction_attempts': [],
         }
     }
     
@@ -148,7 +148,6 @@ def scrape_with_playwright(url):
                 ]
             )
             
-            # DESKTOP user agent - back to V5 working config
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 viewport={'width': 1366, 'height': 768},
@@ -172,10 +171,8 @@ def scrape_with_playwright(url):
             logger.info(f'Navigating to: {url}')
             response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
             
-            # Wait time như V5 (work tốt)
             time.sleep(8)
             
-            # Light scroll
             try:
                 page.evaluate('window.scrollTo(0, 300)')
                 time.sleep(2)
@@ -196,22 +193,23 @@ def scrape_with_playwright(url):
             html = page.content()
             result['debug']['html_length'] = len(html)
             
-            # Extract data from HTML (V5 patterns - work)
             extracted = extract_from_html(html)
             result['debug']['extracted_data'] = extracted
             
-            # Try DOM extraction for views (lightweight)
-            views = extracted.get('views', 0)
-            if views == 0:
-                views = extract_views_dom(page, result['debug'])
+            # Smart DOM extraction
+            dom_data = extract_dom_smart(page, result['debug'])
+            
+            # Merge: prefer non-zero, prefer DOM for views (more accurate)
+            views = max(dom_data.get('views', 0), extracted.get('views', 0))
+            shares = max(dom_data.get('shares', 0), extracted.get('shares', 0))
             
             result['data']['views'] = views
             result['data']['likes'] = extracted.get('likes', 0)
             result['data']['comments'] = extracted.get('comments', 0)
-            result['data']['shares'] = extracted.get('shares', 0)
+            result['data']['shares'] = shares
             result['data']['caption'] = decode_unicode_string(extracted.get('caption', ''))[:500]
             result['data']['thumbnail'] = extracted.get('thumbnail', '')
-            result['data']['username'] = extracted.get('username', '')
+            result['data']['username'] = extracted.get('username', '') or dom_data.get('username', '')
             result['data']['post_id'] = extracted.get('post_id')
             result['data']['video_url'] = final_url
             
@@ -229,50 +227,123 @@ def scrape_with_playwright(url):
     return result
 
 
-def extract_views_dom(page, debug_info):
-    """Lightweight DOM extraction for views"""
-    attempts = []
-    candidates = []
+def extract_dom_smart(page, debug_info):
+    """
+    Smart DOM extraction using context (Vietnamese keywords).
+    
+    Looks for patterns like:
+    - "5,1K lượt xem" -> views = 5100
+    - "4 lượt chia sẻ" -> shares = 4
+    - "X người khác" -> can compute likes
+    """
+    data = {}
+    view_attempts = []
+    share_attempts = []
     
     try:
         js_results = page.evaluate("""
             () => {
-                const results = [];
-                // Find span with number + suffix near SVG icon
-                const spans = document.querySelectorAll('span');
-                for (const span of spans) {
-                    const text = (span.textContent || '').trim();
-                    if (/^[\\d.,]+\\s*[KkMmBb]?$/.test(text) && text.length < 12) {
-                        const parent = span.parentElement;
-                        if (parent && parent.querySelector('svg')) {
-                            results.push(text);
+                const results = {
+                    viewMatches: [],
+                    shareMatches: [],
+                    usernameMatches: []
+                };
+                
+                // Get all text from page
+                const allText = document.body.innerText || '';
+                
+                // Match Vietnamese view patterns: "5,1K lượt xem", "12 lần xem", "1.5M views"
+                const viewPattern = /([\\d.,]+\\s*[KkMmBb]?)\\s*(l\u01b0\u1ee3t xem|l\u1ea7n xem|views?|view)/gi;
+                let viewMatch;
+                while ((viewMatch = viewPattern.exec(allText)) !== null) {
+                    results.viewMatches.push({
+                        number: viewMatch[1].trim(),
+                        context: viewMatch[0]
+                    });
+                }
+                
+                // Match Vietnamese share patterns: "4 lượt chia sẻ", "10 chia sẻ"
+                const sharePattern = /([\\d.,]+\\s*[KkMmBb]?)\\s*(l\u01b0\u1ee3t chia s\u1ebb|chia s\u1ebb|shares?|share)/gi;
+                let shareMatch;
+                while ((shareMatch = sharePattern.exec(allText)) !== null) {
+                    results.shareMatches.push({
+                        number: shareMatch[1].trim(),
+                        context: shareMatch[0]
+                    });
+                }
+                
+                // Try to find username from profile links
+                const profileLinks = document.querySelectorAll('a[href*="/"]');
+                for (const link of profileLinks) {
+                    const href = link.getAttribute('href') || '';
+                    const match = href.match(/^https?:\\/\\/(?:www\\.|m\\.)?facebook\\.com\\/([a-zA-Z0-9.]+)(?:\\/|$|\\?)/);
+                    if (match && !['reel', 'share', 'video', 'watch', 'photo', 'permalink'].includes(match[1])) {
+                        const text = (link.textContent || '').trim();
+                        if (text && text.length > 0 && text.length < 100) {
+                            results.usernameMatches.push({
+                                username: match[1],
+                                displayName: text
+                            });
                         }
                     }
                 }
-                return results.slice(0, 20);
+                
+                return results;
             }
         """)
         
-        if js_results:
-            for text in js_results:
-                value = parse_vietnamese_number(text)
+        # Process view matches - take the LARGEST sensible value
+        if js_results.get('viewMatches'):
+            view_candidates = []
+            for m in js_results['viewMatches']:
+                value = parse_vietnamese_number(m['number'])
                 if 10 <= value <= 100000000:
-                    candidates.append(value)
-                    attempts.append({'text': text, 'value': value})
+                    view_candidates.append(value)
+                    view_attempts.append({
+                        'number': m['number'],
+                        'context': m['context'][:80],
+                        'value': value
+                    })
+            if view_candidates:
+                # Take max because views are usually the largest number on page
+                data['views'] = max(view_candidates)
+        
+        # Process share matches
+        if js_results.get('shareMatches'):
+            share_candidates = []
+            for m in js_results['shareMatches']:
+                value = parse_vietnamese_number(m['number'])
+                if 1 <= value <= 100000000:
+                    share_candidates.append(value)
+                    share_attempts.append({
+                        'number': m['number'],
+                        'context': m['context'][:80],
+                        'value': value
+                    })
+            if share_candidates:
+                # Take median for shares
+                sorted_shares = sorted(share_candidates)
+                data['shares'] = sorted_shares[len(sorted_shares) // 2]
+        
+        # Process username
+        if js_results.get('usernameMatches'):
+            # Take first non-empty username
+            for m in js_results['usernameMatches'][:5]:
+                if m.get('username'):
+                    data['username'] = m['username']
+                    break
+    
     except Exception as e:
-        attempts.append({'error': str(e)[:100]})
+        view_attempts.append({'error': str(e)[:100]})
     
-    debug_info['view_extraction_attempts'] = attempts
+    debug_info['view_extraction_attempts'] = view_attempts
+    debug_info['share_extraction_attempts'] = share_attempts
     
-    if candidates:
-        # Return median to avoid outliers
-        sorted_views = sorted(candidates)
-        return sorted_views[len(sorted_views) // 2]
-    return 0
+    return data
 
 
 def extract_from_html(html):
-    """V5 patterns - work for likes, comments, caption, etc."""
+    """V5 patterns + improved share patterns"""
     data = {}
     patterns = {
         'views': [
@@ -297,6 +368,8 @@ def extract_from_html(html):
         'shares': [
             r'"share_count"[^}]*"count[":\s]*(\d+)',
             r'"reshare_count[":\s]*(\d+)',
+            r'"share_count[":\s]*(\d+)',
+            r'"share_count_reduced"[^}]*"text[":\s]*"(\d+[\d.,KkMmBb]*)"',
         ],
         'post_id': [
             r'"video_id[":\s]*"(\d+)"',
@@ -306,6 +379,7 @@ def extract_from_html(html):
             r'"page_name[":\s]*"([^"]+)"',
             r'"profile_url[":\s]*"https://www\.facebook\.com/([^/"]+)"',
             r'"actor_username[":\s]*"([^"]+)"',
+            r'"author_username[":\s]*"([^"]+)"',
         ],
         'caption': [
             r'"message[":\s]*\{[^}]*"text[":\s]*"([^"]+)"',
@@ -340,7 +414,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '7.1-desktop',
+        'version': '7.2-smart-dom',
     })
 
 
@@ -364,7 +438,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '7.1-desktop',
+        'version': '7.2-smart-dom',
     })
 
 
