@@ -1,6 +1,6 @@
 """
-Rise City Facebook Scraper API - V3 với Playwright 🎩
-Sử dụng Chromium + cookies để giả lập browser thật scrape Facebook
+Rise City Facebook Scraper API - V4 Docker + Playwright 🎩
+Cải tiến: Anti-detection, multi URL strategy, robust DOM parsing
 """
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
@@ -51,118 +51,169 @@ def parse_count(text):
     """Parse '1.2K', '5M', '1,234' to integer"""
     if not text:
         return 0
-    text = str(text).strip().replace(',', '').replace('.', '')
+    s = str(text).strip()
     
-    # Vietnamese number parsing (period as thousand separator)
-    text_clean = re.sub(r'[^\d.,KMBkmbtr]', '', text)
+    # Handle Vietnamese number formats
+    s = s.replace(',', '').replace(' ', '')
     
-    multipliers = {'K': 1000, 'M': 1000000, 'B': 1000000000, 'tr': 1000000, 'k': 1000}
+    multipliers = {
+        'K': 1000, 'k': 1000,
+        'M': 1000000, 'm': 1000000,
+        'B': 1000000000, 'b': 1000000000,
+        'tr': 1000000, 'TR': 1000000,
+        'N': 1000, 'n': 1000,  # Vietnamese "nghìn"
+    }
     
     for suffix, mult in multipliers.items():
-        if suffix in text_clean:
-            num_str = text_clean.replace(suffix, '')
+        if suffix in s:
+            num_part = re.sub(r'[^\d.]', '', s.replace(suffix, ''))
             try:
-                return int(float(num_str) * mult)
+                return int(float(num_part) * mult)
             except:
                 continue
     
     try:
-        return int(re.sub(r'[^\d]', '', text_clean) or 0)
+        return int(re.sub(r'[^\d]', '', s) or 0)
     except:
         return 0
 
 
 def scrape_with_playwright(url):
-    """Scrape Facebook video using Playwright + cookies"""
+    """Scrape Facebook video using Playwright + cookies + anti-detection"""
     
     cookies = parse_netscape_cookies(COOKIES_PATH)
     if not cookies:
-        return {'error': 'No cookies loaded'}
+        return {'success': False, 'error': 'No cookies loaded'}
     
     result = {
         'success': False,
         'data': {
             'views': 0, 'likes': 0, 'comments': 0, 'shares': 0,
-            'caption': '', 'thumbnail': '', 'username': '', 'post_id': None
+            'caption': '', 'thumbnail': '', 'username': '', 'post_id': None,
+            'video_url': '', 'reactions_breakdown': {},
         },
         'debug': {
             'final_url': '',
             'page_title': '',
+            'cookies_count': len(cookies),
             'extracted_data': {},
+            'attempts': [],
         }
     }
     
     try:
         with sync_playwright() as p:
-            # Launch with minimal memory footprint
             browser = p.chromium.launch(
                 headless=True,
                 args=[
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-extensions',
-                    '--no-first-run',
                     '--disable-blink-features=AutomationControlled',
-                    '--single-process',  # Save memory
-                    '--no-zygote',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-gpu',
+                    '--no-first-run',
                 ]
             )
             
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 1280, 'height': 720},
+                viewport={'width': 1366, 'height': 768},
                 locale='vi-VN',
+                timezone_id='Asia/Ho_Chi_Minh',
+                # Anti-detection
+                extra_http_headers={
+                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                }
             )
             
             # Inject cookies
             context.add_cookies(cookies)
             logger.info(f'Injected {len(cookies)} cookies')
             
+            # Create page with anti-detection
             page = context.new_page()
             
-            # Block unnecessary resources to save memory
-            page.route('**/*', lambda route: route.abort() 
-                      if route.request.resource_type in ['image', 'media', 'font', 'stylesheet']
-                      else route.continue_())
+            # Hide webdriver flag
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
+            """)
             
-            # Navigate
+            # Navigate to URL
             logger.info(f'Navigating to: {url}')
-            page.goto(url, wait_until='domcontentloaded', timeout=60000)
+            response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
             
-            # Wait for content to load
-            time.sleep(5)
+            # Wait for Facebook content to load
+            time.sleep(8)
+            
+            # Try to scroll to trigger lazy load
+            try:
+                page.evaluate('window.scrollTo(0, 500)')
+                time.sleep(2)
+                page.evaluate('window.scrollTo(0, 0)')
+                time.sleep(1)
+            except:
+                pass
             
             final_url = page.url
             page_title = page.title()
             result['debug']['final_url'] = final_url
             result['debug']['page_title'] = page_title
+            result['debug']['response_status'] = response.status if response else None
             
             logger.info(f'Final URL: {final_url}')
             logger.info(f'Page title: {page_title}')
             
-            # Try to get HTML and extract data
-            html = page.content()
+            # Detect if we got redirected to login
+            if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
+                result['error'] = 'Redirected to login - cookies invalid or expired'
+                browser.close()
+                return result
             
-            # Extract from HTML using regex (FB embeds data in JSON)
+            # Get HTML content
+            html = page.content()
+            result['debug']['html_length'] = len(html)
+            
+            # Extract data from HTML
             extracted = extract_from_html(html)
             result['debug']['extracted_data'] = extracted
             
-            # Try to get visible counts from DOM
+            # Try DOM extraction too
             dom_data = extract_from_dom(page)
+            result['debug']['dom_data'] = dom_data
             
-            # Merge: prefer DOM data if available, fallback to HTML
-            result['data']['views'] = dom_data.get('views') or extracted.get('views', 0)
-            result['data']['likes'] = dom_data.get('likes') or extracted.get('likes', 0)
-            result['data']['comments'] = dom_data.get('comments') or extracted.get('comments', 0)
-            result['data']['shares'] = dom_data.get('shares') or extracted.get('shares', 0)
-            result['data']['caption'] = dom_data.get('caption') or extracted.get('caption', '')[:500]
+            # Merge results - prefer non-zero values
+            result['data']['views'] = max(
+                dom_data.get('views', 0),
+                extracted.get('views', 0)
+            )
+            result['data']['likes'] = max(
+                dom_data.get('likes', 0),
+                extracted.get('likes', 0)
+            )
+            result['data']['comments'] = max(
+                dom_data.get('comments', 0),
+                extracted.get('comments', 0)
+            )
+            result['data']['shares'] = max(
+                dom_data.get('shares', 0),
+                extracted.get('shares', 0)
+            )
+            result['data']['caption'] = (
+                dom_data.get('caption') or 
+                extracted.get('caption', '')
+            )[:500]
             result['data']['thumbnail'] = extracted.get('thumbnail', '')
             result['data']['username'] = extracted.get('username', '')
             result['data']['post_id'] = extracted.get('post_id')
+            result['data']['video_url'] = final_url
             
-            if (result['data']['views'] > 0 or result['data']['likes'] > 0 or
+            # Mark success if we have any meaningful data
+            if (result['data']['views'] > 0 or 
+                result['data']['likes'] > 0 or
                 result['data']['caption']):
                 result['success'] = True
             
@@ -179,26 +230,29 @@ def extract_from_html(html):
     """Extract data from HTML using regex patterns"""
     data = {}
     
-    # Patterns for various FB data
     patterns = {
         'views': [
             r'"video_view_count[":\s]*(\d+)',
             r'"video_view_count_renderer"[^}]*"count[":\s]*(\d+)',
             r'"play_count[":\s]*(\d+)',
             r'"viewCount[":\s]*(\d+)',
+            r'"unified_view_count_renderer"[^}]*"count[":\s]*(\d+)',
         ],
         'likes': [
             r'"reaction_count"[^}]*"count[":\s]*(\d+)',
             r'"top_reactions"[^}]*"count[":\s]*(\d+)',
+            r'"likers"[^}]*"count[":\s]*(\d+)',
             r'"likes_count[":\s]*(\d+)',
         ],
         'comments': [
             r'"total_comment_count[":\s]*(\d+)',
             r'"comment_count"[^}]*"total_count[":\s]*(\d+)',
+            r'"comments_count_summary_renderer"[^}]*"count[":\s]*(\d+)',
         ],
         'shares': [
             r'"share_count"[^}]*"count[":\s]*(\d+)',
             r'"share_count_reduced[":\s]*"([^"]+)"',
+            r'"reshare_count[":\s]*(\d+)',
         ],
         'post_id': [
             r'"top_level_post_id[":\s]*"(\d+)"',
@@ -207,6 +261,7 @@ def extract_from_html(html):
         'username': [
             r'"page_name[":\s]*"([^"]+)"',
             r'"author_username[":\s]*"([^"]+)"',
+            r'"actor_username[":\s]*"([^"]+)"',
         ],
         'caption': [
             r'"message[":\s]*\{[^}]*"text[":\s]*"([^"]+)"',
@@ -215,6 +270,7 @@ def extract_from_html(html):
         'thumbnail': [
             r'<meta\s+property="og:image"\s+content="([^"]+)"',
             r'"first_frame_thumbnail[":\s]*"([^"]+)"',
+            r'"thumbnailImage[":\s]*\{[^}]*"uri[":\s]*"([^"]+)"',
         ]
     }
     
@@ -226,44 +282,53 @@ def extract_from_html(html):
                 if field in ['views', 'likes', 'comments', 'shares']:
                     data[field] = parse_count(value)
                 else:
-                    data[field] = value.replace('\\u003C', '<').replace('\\/', '/')[:500]
+                    data[field] = value.replace('\\u003C', '<').replace('\\/', '/').replace('\\u0026', '&')[:500]
                 break
     
     return data
 
 
 def extract_from_dom(page):
-    """Extract visible counts from DOM"""
+    """Extract visible counts from DOM using JavaScript"""
     data = {}
     
     try:
-        # Get caption from meta or visible text
+        # Try meta tags first
         try:
-            desc = page.locator('meta[property="og:description"]').get_attribute('content', timeout=2000)
+            desc = page.locator('meta[property="og:description"]').first.get_attribute('content', timeout=3000)
             if desc:
                 data['caption'] = desc[:500]
         except:
             pass
         
-        # Try to find view count in visible text
+        # Try to extract via JavaScript - looks for common FB data structures
         try:
-            # Vietnamese: "lượt xem", English: "views"
-            view_patterns = [
-                'text=/\\d[\\d.,]*[KkMmBb]?\\s*(views?|lượt xem|lần xem)/i',
-            ]
-            for pattern in view_patterns:
-                elements = page.locator(pattern).all()
-                for el in elements[:3]:
-                    text = el.text_content()
-                    if text:
-                        match = re.search(r'(\d[\d.,]*[KkMmBb]?)', text)
-                        if match:
-                            data['views'] = parse_count(match.group(1))
-                            break
-                if data.get('views'):
-                    break
-        except:
-            pass
+            js_data = page.evaluate("""
+                () => {
+                    const result = {};
+                    
+                    // Try to find view count in scripts
+                    const scripts = document.querySelectorAll('script');
+                    for (const script of scripts) {
+                        const text = script.textContent || '';
+                        if (text.includes('video_view_count')) {
+                            const match = text.match(/"video_view_count[":\\\\s]*(\\\\d+)/);
+                            if (match) result.views = parseInt(match[1]);
+                        }
+                        if (text.includes('reaction_count')) {
+                            const match = text.match(/"reaction_count"[^}]*"count[":\\\\s]*(\\\\d+)/);
+                            if (match) result.likes = parseInt(match[1]);
+                        }
+                    }
+                    
+                    return result;
+                }
+            """)
+            if js_data:
+                data.update(js_data)
+        except Exception as e:
+            logger.warning(f'JS extract failed: {e}')
+        
     except Exception as e:
         logger.warning(f'DOM extract failed: {e}')
     
@@ -275,8 +340,8 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '3.0-playwright',
-        'engine': 'Playwright + Chromium',
+        'version': '4.0-docker-playwright',
+        'engine': 'Playwright + Chromium + Anti-detection',
     })
 
 
@@ -285,11 +350,23 @@ def health():
     cookies_exist = os.path.exists(COOKIES_PATH)
     cookies_count = len(parse_netscape_cookies(COOKIES_PATH)) if cookies_exist else 0
     
+    # Try to verify Chromium is available
+    chromium_ok = False
+    chromium_path = None
+    try:
+        with sync_playwright() as p:
+            chromium_path = p.chromium.executable_path
+            chromium_ok = os.path.exists(chromium_path) if chromium_path else False
+    except Exception as e:
+        chromium_path = f'Error: {e}'
+    
     return jsonify({
         'status': 'ok',
         'cookies_loaded': cookies_exist,
         'cookies_count': cookies_count,
-        'version': '3.0-playwright',
+        'chromium_ok': chromium_ok,
+        'chromium_path': chromium_path,
+        'version': '4.0-docker-playwright',
     })
 
 
@@ -305,7 +382,7 @@ def scrape_endpoint():
     if not url:
         return jsonify({'error': 'Missing url'}), 400
     
-    logger.info(f'Scraping with Playwright: {url}')
+    logger.info(f'Scraping: {url}')
     result = scrape_with_playwright(url)
     return jsonify(result)
 
