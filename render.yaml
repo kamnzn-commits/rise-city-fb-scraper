@@ -1,0 +1,17 @@
+# Render configuration
+# Render sẽ tự động đọc file này khi deploy
+
+services:
+  - type: web
+    name: rise-city-fb-scraper
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 120 app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: API_SECRET
+        generateValue: true  # Render sẽ tự tạo secret ngẫu nhiên
+      - key: FB_COOKIES_PATH
+        value: /etc/secrets/cookies.txt
