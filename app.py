@@ -1,18 +1,19 @@
 """
-Rise City Facebook Scraper API - V8.0 🎩
-DUAL MODE STRATEGY:
+Rise City Facebook Scraper API - V8.1 🎩
+TRIỆT ĐỂ KHÔNG TỐN PHÍ:
 
-Mode A (Desktop with cookies): Lấy engagement metadata
-  - likes, comments, shares (mobile innertext - V7.8 logic)
-  - caption full, thumbnail, post_id
+5 ATTEMPTS PER REQUEST:
+1. Cookies + Desktop Chrome (current best for engagement)
+2. NO cookies + iPhone 15 Pro Safari + Google referer (NEW)
+3. NO cookies + Android Chrome + Vietnam location (NEW)
+4. Cookies + mbasic.facebook.com text-only (NEW lightweight)
+5. Cookies + mobile m.facebook.com (current backup)
 
-Mode B (Desktop WITHOUT cookies - anonymous): Lấy views
-  - FB hiển thị view cho user ẩn danh
-  - Cookies của account phụ đôi khi làm FB ẩn view
-
-Mode C (Mobile m.facebook.com): Backup engagement
-  
-Lấy MAX views, MAX likes/comments/shares từ tất cả modes.
+Strategy:
+- Mode 1: Engagement (likes, comments, shares, caption, thumbnail)
+- Mode 2-4: Anonymous views (try multiple fingerprints)
+- Mode 5: Mobile engagement backup
+- Combine: MAX of all view sources
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -148,7 +149,6 @@ def parse_vietnamese_number(text):
 
 
 def parse_mobile_engagement(innertext, debug_info):
-    """Parse engagement from mobile innertext (V7.8 - works)"""
     data = {'likes': 0, 'comments': 0, 'shares': 0}
     
     if not innertext:
@@ -172,22 +172,8 @@ def parse_mobile_engagement(innertext, debug_info):
     return data
 
 
-def simulate_human(page):
-    try:
-        for _ in range(2):
-            x = random.randint(100, 1200)
-            y = random.randint(100, 600)
-            page.mouse.move(x, y)
-            time.sleep(random.uniform(0.3, 0.5))
-        for offset in [200, 500]:
-            page.evaluate(f'window.scrollTo({{top: {offset}, behavior: "smooth"}})')
-            time.sleep(random.uniform(0.6, 1.0))
-    except Exception as e:
-        logger.warning(f'Human sim failed: {e}')
-
-
 def search_views_in_text(text):
-    """Search Vietnamese view patterns in any text"""
+    """Search Vietnamese view patterns + JSON patterns in any text"""
     candidates = []
     
     patterns = [
@@ -204,7 +190,6 @@ def search_views_in_text(text):
             if 10 <= value <= 1000000000:
                 candidates.append(value)
     
-    # Also try JSON patterns
     json_patterns = [
         r'"video_view_count"\s*:\s*(\d+)',
         r'"play_count"\s*:\s*(\d+)',
@@ -226,78 +211,186 @@ def search_views_in_text(text):
     return max(candidates) if candidates else 0
 
 
-def scrape_anonymous_for_views(browser, url, debug_info):
+def simulate_human(page):
+    try:
+        for _ in range(2):
+            x = random.randint(100, 1200)
+            y = random.randint(100, 600)
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.3, 0.5))
+        for offset in [200, 500]:
+            page.evaluate(f'window.scrollTo({{top: {offset}, behavior: "smooth"}})')
+            time.sleep(random.uniform(0.6, 1.0))
+    except:
+        pass
+
+
+# ==========================================
+# FINGERPRINTS - 3 different realistic profiles
+# ==========================================
+
+FINGERPRINT_IPHONE_15 = {
+    'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+    'viewport': {'width': 393, 'height': 852},
+    'device_scale_factor': 3,
+    'is_mobile': True,
+    'has_touch': True,
+    'extra_headers': {
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': 'https://www.google.com/',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'cross-site',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
+    }
+}
+
+FINGERPRINT_ANDROID_S24 = {
+    'user_agent': 'Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+    'viewport': {'width': 384, 'height': 834},
+    'device_scale_factor': 2.75,
+    'is_mobile': True,
+    'has_touch': True,
+    'extra_headers': {
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Referer': 'https://www.google.com/search?q=facebook+reel',
+        'sec-ch-ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+        'sec-ch-ua-mobile': '?1',
+        'sec-ch-ua-platform': '"Android"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'cross-site',
+        'Upgrade-Insecure-Requests': '1',
+    }
+}
+
+FINGERPRINT_DESKTOP_CHROME_VN = {
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'viewport': {'width': 1366, 'height': 768},
+    'device_scale_factor': 1,
+    'is_mobile': False,
+    'has_touch': False,
+    'extra_headers': {
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Referer': 'https://www.google.com.vn/',
+        'sec-ch-ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'cross-site',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
+    }
+}
+
+
+def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
     """
-    Mode B: Open URL WITHOUT cookies to get views.
-    FB shows view counter to anonymous users for some videos.
+    Try to scrape views WITHOUT cookies but with realistic fingerprint.
+    The key insight: Different fingerprints might bypass FB's anti-bot.
     """
     try:
-        debug_info['anonymous_attempted'] = True
+        debug_info[f'{name}_attempted'] = True
         
-        # Anonymous context - NO cookies, fresh browser fingerprint
         context = browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport={'width': 1366, 'height': 768},
+            user_agent=fingerprint['user_agent'],
+            viewport=fingerprint['viewport'],
+            device_scale_factor=fingerprint['device_scale_factor'],
+            is_mobile=fingerprint['is_mobile'],
+            has_touch=fingerprint['has_touch'],
             locale='vi-VN',
             timezone_id='Asia/Ho_Chi_Minh',
-            extra_http_headers={
-                'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            }
+            extra_http_headers=fingerprint['extra_headers'],
         )
         
-        # NO cookies added - anonymous mode
+        # NO cookies - anonymous
         page = context.new_page()
         
+        # Anti-detection scripts
         page.add_init_script("""
+            // Override webdriver detection
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
+            
+            // Fake chrome runtime
+            window.chrome = { runtime: {} };
+            
+            // Hide playwright trace
+            const originalQuery = window.navigator.permissions?.query;
+            if (originalQuery) {
+                window.navigator.permissions.query = (params) => (
+                    params.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : originalQuery(params)
+                );
+            }
+            
+            // Pretend to have screen
+            Object.defineProperty(screen, 'availWidth', { get: () => 1366 });
+            Object.defineProperty(screen, 'availHeight', { get: () => 768 });
         """)
         
-        logger.info(f'Anonymous mode navigating to: {url}')
-        
-        # Capture network for view counter (some FB endpoints expose it)
-        captured_anon = []
+        # Capture all responses
+        captured_responses = []
         def handle_response(response):
             try:
                 if response.status == 200:
                     url_lower = response.url.lower()
-                    if 'graphql' in url_lower or '/video' in url_lower or 'reel' in url_lower:
+                    if any(k in url_lower for k in ['graphql', 'reel', 'video', 'fb_dtsg', 'jsmods']):
                         try:
                             body = response.text()
                             if body and len(body) < 3000000:
-                                captured_anon.append(body)
+                                captured_responses.append(body)
                         except:
                             pass
             except:
                 pass
         page.on('response', handle_response)
         
+        logger.info(f'{name} navigating to: {url}')
         response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
-        time.sleep(7)
         
-        # Try to dismiss login popup if appears
+        # Random wait like real user (3-7s)
+        time.sleep(random.uniform(3, 6))
+        
+        # Try to dismiss login overlay if appears (without dismissing video)
         try:
             page.evaluate("""
                 () => {
-                    // Close any dialog/popup
-                    const closeButtons = document.querySelectorAll('[aria-label*="Close"], [aria-label*="Đóng"]');
-                    closeButtons.forEach(btn => btn.click());
+                    // Find and remove login modals (but keep page visible)
+                    const dialogs = document.querySelectorAll('[role="dialog"]');
+                    dialogs.forEach(d => {
+                        const text = d.textContent || '';
+                        if (text.includes('Đăng nhập') || text.includes('Log in')) {
+                            d.style.display = 'none';
+                        }
+                    });
+                    // Remove overlays
+                    const overlays = document.querySelectorAll('[data-testid*="login"], [aria-label*="Đăng nhập"]');
+                    overlays.forEach(o => o.style.display = 'none');
                 }
             """)
             time.sleep(1)
         except:
             pass
         
-        # Scroll
+        # Scroll to trigger view counter render
         try:
-            page.evaluate('window.scrollTo(0, 400)')
+            page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
+            time.sleep(2)
+            page.evaluate('window.scrollTo({top: 600, behavior: "smooth"})')
             time.sleep(2)
         except:
             pass
         
-        # Get HTML and innertext
+        # Get all data
         html = page.content()
         innertext = ''
         try:
@@ -305,28 +398,84 @@ def scrape_anonymous_for_views(browser, url, debug_info):
         except:
             pass
         
-        debug_info['anonymous_html_length'] = len(html)
-        debug_info['anonymous_innertext_length'] = len(innertext)
-        debug_info['anonymous_innertext_sample'] = innertext[:1500]
-        debug_info['anonymous_network_count'] = len(captured_anon)
-        debug_info['anonymous_html_keywords'] = {
+        debug_info[f'{name}_html_length'] = len(html)
+        debug_info[f'{name}_innertext_length'] = len(innertext)
+        debug_info[f'{name}_innertext_preview'] = innertext[:300]
+        debug_info[f'{name}_network_count'] = len(captured_responses)
+        debug_info[f'{name}_url_after_redirect'] = page.url
+        
+        # Check if redirected to login
+        if 'login' in page.url.lower() or 'Đăng nhập vào Facebook' in innertext[:200]:
+            debug_info[f'{name}_blocked'] = True
+            context.close()
+            return 0
+        
+        # Search views in all sources
+        all_text = '\n'.join([html, innertext] + captured_responses)
+        views = search_views_in_text(all_text)
+        
+        debug_info[f'{name}_views_found'] = views
+        debug_info[f'{name}_html_keywords'] = {
             'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
             'has_video_view_count': 'video_view_count' in html,
             'has_play_count': 'play_count' in html,
         }
         
-        # Search views in HTML, innertext, and captured network responses
-        all_text_sources = [html, innertext] + captured_anon
-        combined_text = '\n'.join(all_text_sources)
+        context.close()
+        return views
+    except Exception as e:
+        logger.warning(f'{name} mode failed: {e}')
+        debug_info[f'{name}_error'] = str(e)[:200]
+        return 0
+
+
+def try_mbasic_for_views(browser, url, cookies, debug_info):
+    """
+    NEW MODE: mbasic.facebook.com - text-only mobile site.
+    Sometimes shows view counter that desktop/mobile hides.
+    """
+    try:
+        debug_info['mbasic_attempted'] = True
         
-        views = search_views_in_text(combined_text)
-        debug_info['anonymous_views_found'] = views
+        # Convert URL to mbasic
+        mbasic_url = url.replace('www.facebook.com', 'mbasic.facebook.com')
+        if 'mbasic.facebook.com' not in mbasic_url:
+            mbasic_url = mbasic_url.replace('facebook.com', 'mbasic.facebook.com')
+        
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Linux; Android 7.0; SM-G930V) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.125 Mobile Safari/537.36',
+            viewport={'width': 360, 'height': 640},
+            locale='vi-VN',
+            timezone_id='Asia/Ho_Chi_Minh',
+        )
+        
+        context.add_cookies(cookies)
+        page = context.new_page()
+        
+        logger.info(f'mbasic navigating to: {mbasic_url}')
+        response = page.goto(mbasic_url, wait_until='domcontentloaded', timeout=30000)
+        time.sleep(4)
+        
+        html = page.content()
+        innertext = ''
+        try:
+            innertext = page.evaluate('document.body.innerText || ""')
+        except:
+            pass
+        
+        debug_info['mbasic_html_length'] = len(html)
+        debug_info['mbasic_innertext_length'] = len(innertext)
+        debug_info['mbasic_innertext_preview'] = innertext[:500]
+        
+        all_text = html + '\n' + innertext
+        views = search_views_in_text(all_text)
+        debug_info['mbasic_views_found'] = views
         
         context.close()
         return views
     except Exception as e:
-        logger.warning(f'Anonymous mode failed: {e}')
-        debug_info['anonymous_error'] = str(e)[:200]
+        logger.warning(f'mbasic mode failed: {e}')
+        debug_info['mbasic_error'] = str(e)[:200]
         return 0
 
 
@@ -348,7 +497,6 @@ def scrape_with_playwright(url):
             'extracted_data': {},
             'mode_used': '',
             'tried_modes': [],
-            'html_search_results': {},
             'view_sources': {},
         }
     }
@@ -365,25 +513,36 @@ def scrape_with_playwright(url):
                     '--disable-gpu',
                     '--no-first-run',
                     '--disable-infobars',
-                    '--window-size=1366,768',
                 ]
             )
             
-            # === MODE A: Desktop with cookies (engagement + metadata) ===
-            views_cookies = try_desktop_mode(browser, url, cookies, result)
-            result['debug']['view_sources']['cookies'] = views_cookies
+            # === ATTEMPT 1: Desktop with cookies (engagement + metadata) ===
+            views_1 = try_desktop_with_cookies(browser, url, cookies, result)
+            result['debug']['view_sources']['desktop_cookies'] = views_1
             
-            # === MODE B: ANONYMOUS (NEW - to get hidden views) ===
-            anonymous_views = scrape_anonymous_for_views(browser, url, result['debug'])
-            result['debug']['view_sources']['anonymous'] = anonymous_views
+            # === ATTEMPT 2: iPhone 15 anonymous (NEW) ===
+            views_2 = try_anonymous_with_fingerprint(
+                browser, url, FINGERPRINT_IPHONE_15, 'iphone15', result['debug']
+            )
+            result['debug']['view_sources']['iphone15_anon'] = views_2
             
-            # === MODE C: Mobile m.facebook.com (engagement backup) ===
+            # === ATTEMPT 3: Android S24 anonymous (NEW) ===
+            views_3 = try_anonymous_with_fingerprint(
+                browser, url, FINGERPRINT_ANDROID_S24, 'android', result['debug']
+            )
+            result['debug']['view_sources']['android_anon'] = views_3
+            
+            # === ATTEMPT 4: mbasic.facebook.com text-only (NEW) ===
+            views_4 = try_mbasic_for_views(browser, url, cookies, result['debug'])
+            result['debug']['view_sources']['mbasic_cookies'] = views_4
+            
+            # === ATTEMPT 5: Mobile m.facebook.com (engagement backup) ===
             try_mobile_mode(browser, url, cookies, result)
             
             browser.close()
             
-            # COMBINE: Take MAX of all view sources
-            final_views = max(views_cookies, anonymous_views)
+            # COMBINE: Take MAX views from all sources
+            final_views = max(views_1, views_2, views_3, views_4)
             if final_views > 0:
                 result['data']['views'] = final_views
             
@@ -399,8 +558,8 @@ def scrape_with_playwright(url):
     return result
 
 
-def try_desktop_mode(browser, url, cookies, result):
-    """Mode A: Desktop with cookies - engagement + metadata. Returns views (may be 0)."""
+def try_desktop_with_cookies(browser, url, cookies, result):
+    """Mode 1: Desktop with cookies for engagement + metadata"""
     try:
         result['debug']['tried_modes'].append('desktop_cookies')
         
@@ -424,7 +583,6 @@ def try_desktop_mode(browser, url, cookies, result):
             Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
         """)
         
-        logger.info(f'Desktop+cookies navigating to: {url}')
         response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
         time.sleep(7)
         simulate_human(page)
@@ -436,38 +594,27 @@ def try_desktop_mode(browser, url, cookies, result):
         result['debug']['page_title'] = page_title
         
         if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
-            result['error'] = 'Redirected to login - cookies invalid'
+            result['error'] = 'Redirected to login'
             context.close()
             return 0
         
         html = page.content()
         result['debug']['html_length'] = len(html)
         
-        # Try to find views
         views = search_views_in_text(html)
         
-        # Metadata
         extracted = extract_metadata_from_html(html)
         result['debug']['extracted_data'] = extracted
         
-        # Username
         dom_data = extract_username_from_dom(page)
-        
-        result['debug']['html_search_results'] = {
-            'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
-            'has_video_view_count': 'video_view_count' in html,
-            'has_play_count': 'play_count' in html,
-        }
         
         result['debug']['mode_used'] = 'desktop_cookies'
         
-        # Caption full
         raw_caption = extracted.get('caption', '')
         if raw_caption:
             decoded = decode_unicode_string(raw_caption)
             result['data']['caption'] = decoded[:5000]
         
-        # Thumbnail decode
         raw_thumbnail = extracted.get('thumbnail', '')
         if raw_thumbnail:
             result['data']['thumbnail'] = decode_html_entities(raw_thumbnail)
@@ -484,7 +631,7 @@ def try_desktop_mode(browser, url, cookies, result):
 
 
 def try_mobile_mode(browser, url, cookies, result):
-    """Mode C: Mobile m.facebook.com for engagement"""
+    """Mode 5: Mobile m.facebook.com for engagement"""
     try:
         result['debug']['tried_modes'].append('mobile_cookies')
         
@@ -506,7 +653,6 @@ def try_mobile_mode(browser, url, cookies, result):
         context.add_cookies(cookies)
         page = context.new_page()
         
-        logger.info(f'Mobile+cookies navigating to: {mobile_url}')
         response = page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
         time.sleep(random.uniform(5, 6))
         
@@ -539,7 +685,9 @@ def try_mobile_mode(browser, url, cookies, result):
         if mobile_innertext:
             mobile_views = search_views_in_text(mobile_innertext)
             if mobile_views > 0:
-                result['debug']['view_sources']['mobile'] = mobile_views
+                result['debug']['view_sources']['mobile_cookies'] = mobile_views
+                if mobile_views > result['data']['views']:
+                    result['data']['views'] = mobile_views
         
         context.close()
     except Exception as e:
@@ -582,7 +730,6 @@ def extract_username_from_dom(page):
 def extract_metadata_from_html(html):
     data = {}
     
-    # Post ID
     for pat in [
         r'"video_id"\s*:\s*"(\d+)"',
         r'"top_level_post_id"\s*:\s*"(\d+)"',
@@ -592,7 +739,6 @@ def extract_metadata_from_html(html):
             data['post_id'] = m.group(1)
             break
     
-    # Caption - take longest candidate
     caption_candidates = []
     
     m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
@@ -612,7 +758,6 @@ def extract_metadata_from_html(html):
         caption_candidates.sort(key=len, reverse=True)
         data['caption'] = caption_candidates[0]
     
-    # Thumbnail
     for pat in [
         r'<meta\s+property="og:image"\s+content="([^"]+)"',
         r'"first_frame_thumbnail"\s*:\s*"([^"]+)"',
@@ -630,7 +775,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.0-dual-mode',
+        'version': '8.1-multi-fingerprint',
     })
 
 
@@ -654,7 +799,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.0-dual-mode',
+        'version': '8.1-multi-fingerprint',
     })
 
 
