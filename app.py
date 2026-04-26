@@ -1,11 +1,11 @@
 """
-Rise City Facebook Scraper API - V7 Optimized 🎩
-Cải tiến từ V6.1:
-- Bỏ navigate kép, chỉ 1 lần truy cập (giảm 50% thời gian)
-- Giảm wait time (5s thay vì 8s)
-- JS DOM walker đơn giản hơn (ít memory)
+Rise City Facebook Scraper API - V7.1 🎩
+Quay về Desktop UA (V5 logic), thêm view extraction nhẹ:
+- Desktop user agent (như V5 - lấy được full data)
+- /share/r/ URL trực tiếp (không redirect mobile)
+- Wait time vừa phải (8s)
+- Thêm DOM walker cho views (lightweight)
 - CORS giữ nguyên
-- Chú trọng STABILITY > tính năng
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -148,14 +148,16 @@ def scrape_with_playwright(url):
                 ]
             )
             
-            # Use mobile viewport directly - more lightweight
+            # DESKTOP user agent - back to V5 working config
             context = browser.new_context(
-                user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
-                viewport={'width': 414, 'height': 896},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1366, 'height': 768},
                 locale='vi-VN',
                 timezone_id='Asia/Ho_Chi_Minh',
-                is_mobile=True,
-                has_touch=True,
+                extra_http_headers={
+                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                }
             )
             
             context.add_cookies(cookies)
@@ -163,21 +165,22 @@ def scrape_with_playwright(url):
             
             page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
             """)
             
-            # If URL is /share/r/, redirect to mobile reel URL directly
-            target_url = url
-            if '/share/r/' in url or 'facebook.com/reel' in url:
-                # Try to extract reel ID from URL
-                reel_id_match = re.search(r'/reel/(\d+)', url)
-                if reel_id_match:
-                    target_url = f'https://m.facebook.com/reel/{reel_id_match.group(1)}'
+            logger.info(f'Navigating to: {url}')
+            response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
             
-            logger.info(f'Navigating to: {target_url}')
-            response = page.goto(target_url, wait_until='domcontentloaded', timeout=45000)
+            # Wait time như V5 (work tốt)
+            time.sleep(8)
             
-            # Single wait, less time
-            time.sleep(6)
+            # Light scroll
+            try:
+                page.evaluate('window.scrollTo(0, 300)')
+                time.sleep(2)
+            except:
+                pass
             
             final_url = page.url
             page_title = page.title()
@@ -193,7 +196,7 @@ def scrape_with_playwright(url):
             html = page.content()
             result['debug']['html_length'] = len(html)
             
-            # Extract data
+            # Extract data from HTML (V5 patterns - work)
             extracted = extract_from_html(html)
             result['debug']['extracted_data'] = extracted
             
@@ -232,14 +235,13 @@ def extract_views_dom(page, debug_info):
     candidates = []
     
     try:
-        # Simple JS - just find spans with numbers near SVG
         js_results = page.evaluate("""
             () => {
                 const results = [];
+                // Find span with number + suffix near SVG icon
                 const spans = document.querySelectorAll('span');
                 for (const span of spans) {
                     const text = (span.textContent || '').trim();
-                    // Match Vietnamese number format: 1,5K or 1.5K or 1500
                     if (/^[\\d.,]+\\s*[KkMmBb]?$/.test(text) && text.length < 12) {
                         const parent = span.parentElement;
                         if (parent && parent.querySelector('svg')) {
@@ -247,7 +249,7 @@ def extract_views_dom(page, debug_info):
                         }
                     }
                 }
-                return results.slice(0, 10);
+                return results.slice(0, 20);
             }
         """)
         
@@ -263,13 +265,14 @@ def extract_views_dom(page, debug_info):
     debug_info['view_extraction_attempts'] = attempts
     
     if candidates:
-        # Return median
+        # Return median to avoid outliers
         sorted_views = sorted(candidates)
         return sorted_views[len(sorted_views) // 2]
     return 0
 
 
 def extract_from_html(html):
+    """V5 patterns - work for likes, comments, caption, etc."""
     data = {}
     patterns = {
         'views': [
@@ -277,11 +280,15 @@ def extract_from_html(html):
             r'"play_count[":\s]*(\d+)',
             r'"viewCount[":\s]*(\d+)',
             r'"unified_view_count_renderer"[^}]*"count[":\s]*(\d+)',
+            r'"reels_view_count[":\s]*(\d+)',
+            r'"organic_view_count[":\s]*(\d+)',
+            r'"playbackVideoMetadata"[^}]*"viewCount[":\s]*(\d+)',
         ],
         'likes': [
             r'"reaction_count"[^}]*"count[":\s]*(\d+)',
             r'"top_reactions"[^}]*"count[":\s]*(\d+)',
             r'"likers"[^}]*"count[":\s]*(\d+)',
+            r'"reactors"[^}]*"count[":\s]*(\d+)',
         ],
         'comments': [
             r'"total_comment_count[":\s]*(\d+)',
@@ -298,6 +305,7 @@ def extract_from_html(html):
         'username': [
             r'"page_name[":\s]*"([^"]+)"',
             r'"profile_url[":\s]*"https://www\.facebook\.com/([^/"]+)"',
+            r'"actor_username[":\s]*"([^"]+)"',
         ],
         'caption': [
             r'"message[":\s]*\{[^}]*"text[":\s]*"([^"]+)"',
@@ -332,7 +340,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '7.0-optimized',
+        'version': '7.1-desktop',
     })
 
 
@@ -356,7 +364,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '7.0-optimized',
+        'version': '7.1-desktop',
     })
 
 
