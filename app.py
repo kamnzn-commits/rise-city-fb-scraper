@@ -1,14 +1,18 @@
 """
-Rise City Facebook Scraper API - V7.9 🎩
-Fix triệt để vấn đề video không có view count:
+Rise City Facebook Scraper API - V8.0 🎩
+DUAL MODE STRATEGY:
 
-1. Caption: tăng giới hạn 500 → 5000 ký tự, thêm fallback patterns
-2. View extraction (3 strategy mới):
-   - Strategy A: Search HTML "lượt xem" (V7.3 - cũ)  
-   - Strategy B: Search mobile innertext (V7.7 - cũ)
-   - Strategy C: Capture GraphQL responses chứa play_count
-   - Strategy D: Search JSON nested cho video_view_count
-   - Strategy E: Wait dài + scroll trigger force JS load
+Mode A (Desktop with cookies): Lấy engagement metadata
+  - likes, comments, shares (mobile innertext - V7.8 logic)
+  - caption full, thumbnail, post_id
+
+Mode B (Desktop WITHOUT cookies - anonymous): Lấy views
+  - FB hiển thị view cho user ẩn danh
+  - Cookies của account phụ đôi khi làm FB ẩn view
+
+Mode C (Mobile m.facebook.com): Backup engagement
+  
+Lấy MAX views, MAX likes/comments/shares từ tất cả modes.
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -38,9 +42,6 @@ USERNAME_BLACKLIST = {
     'terms', 'community', 'safety', 'legal', 'careers', 'ads',
     'developers', 'directory', 'badges', 'feed', 'timeline'
 }
-
-# Global cache for captured GraphQL responses
-captured_responses = []
 
 
 @app.after_request
@@ -72,7 +73,6 @@ def decode_unicode_string(s):
 
 
 def decode_html_entities(text):
-    """Decode HTML entities like &amp; → &"""
     if not text:
         return text
     return (text
@@ -174,22 +174,163 @@ def parse_mobile_engagement(innertext, debug_info):
 
 def simulate_human(page):
     try:
-        for _ in range(3):
+        for _ in range(2):
             x = random.randint(100, 1200)
             y = random.randint(100, 600)
             page.mouse.move(x, y)
-            time.sleep(random.uniform(0.3, 0.8))
-        for offset in [200, 400, 600, 300]:
+            time.sleep(random.uniform(0.3, 0.5))
+        for offset in [200, 500]:
             page.evaluate(f'window.scrollTo({{top: {offset}, behavior: "smooth"}})')
-            time.sleep(random.uniform(0.8, 1.5))
+            time.sleep(random.uniform(0.6, 1.0))
     except Exception as e:
         logger.warning(f'Human sim failed: {e}')
 
 
-def scrape_with_playwright(url):
-    global captured_responses
-    captured_responses = []
+def search_views_in_text(text):
+    """Search Vietnamese view patterns in any text"""
+    candidates = []
     
+    patterns = [
+        r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem',
+        r'([\d.,]+\s*[KkMmBb]?)\s*l\\u01b0\\u1ee3t\s*xem',
+        r'([\d.,]+\s*[KkMmBb]?)\s*l\u1ea7n\s*xem',
+        r'([\d.,]+\s*[KkMmBb]?)\s*views?\b',
+    ]
+    
+    for pat in patterns:
+        matches = re.findall(pat, text, re.IGNORECASE)
+        for m in matches[:30]:
+            value = parse_vietnamese_number(m)
+            if 10 <= value <= 1000000000:
+                candidates.append(value)
+    
+    # Also try JSON patterns
+    json_patterns = [
+        r'"video_view_count"\s*:\s*(\d+)',
+        r'"play_count"\s*:\s*(\d+)',
+        r'"viewCount"\s*:\s*(\d+)',
+        r'"reels_view_count"\s*:\s*(\d+)',
+        r'"organic_view_count"\s*:\s*(\d+)',
+    ]
+    
+    for pat in json_patterns:
+        matches = re.findall(pat, text)
+        for m in matches:
+            try:
+                val = int(m)
+                if 10 <= val <= 1000000000:
+                    candidates.append(val)
+            except:
+                pass
+    
+    return max(candidates) if candidates else 0
+
+
+def scrape_anonymous_for_views(browser, url, debug_info):
+    """
+    Mode B: Open URL WITHOUT cookies to get views.
+    FB shows view counter to anonymous users for some videos.
+    """
+    try:
+        debug_info['anonymous_attempted'] = True
+        
+        # Anonymous context - NO cookies, fresh browser fingerprint
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1366, 'height': 768},
+            locale='vi-VN',
+            timezone_id='Asia/Ho_Chi_Minh',
+            extra_http_headers={
+                'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            }
+        )
+        
+        # NO cookies added - anonymous mode
+        page = context.new_page()
+        
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
+        """)
+        
+        logger.info(f'Anonymous mode navigating to: {url}')
+        
+        # Capture network for view counter (some FB endpoints expose it)
+        captured_anon = []
+        def handle_response(response):
+            try:
+                if response.status == 200:
+                    url_lower = response.url.lower()
+                    if 'graphql' in url_lower or '/video' in url_lower or 'reel' in url_lower:
+                        try:
+                            body = response.text()
+                            if body and len(body) < 3000000:
+                                captured_anon.append(body)
+                        except:
+                            pass
+            except:
+                pass
+        page.on('response', handle_response)
+        
+        response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
+        time.sleep(7)
+        
+        # Try to dismiss login popup if appears
+        try:
+            page.evaluate("""
+                () => {
+                    // Close any dialog/popup
+                    const closeButtons = document.querySelectorAll('[aria-label*="Close"], [aria-label*="Đóng"]');
+                    closeButtons.forEach(btn => btn.click());
+                }
+            """)
+            time.sleep(1)
+        except:
+            pass
+        
+        # Scroll
+        try:
+            page.evaluate('window.scrollTo(0, 400)')
+            time.sleep(2)
+        except:
+            pass
+        
+        # Get HTML and innertext
+        html = page.content()
+        innertext = ''
+        try:
+            innertext = page.evaluate('document.body.innerText || ""')
+        except:
+            pass
+        
+        debug_info['anonymous_html_length'] = len(html)
+        debug_info['anonymous_innertext_length'] = len(innertext)
+        debug_info['anonymous_innertext_sample'] = innertext[:1500]
+        debug_info['anonymous_network_count'] = len(captured_anon)
+        debug_info['anonymous_html_keywords'] = {
+            'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
+            'has_video_view_count': 'video_view_count' in html,
+            'has_play_count': 'play_count' in html,
+        }
+        
+        # Search views in HTML, innertext, and captured network responses
+        all_text_sources = [html, innertext] + captured_anon
+        combined_text = '\n'.join(all_text_sources)
+        
+        views = search_views_in_text(combined_text)
+        debug_info['anonymous_views_found'] = views
+        
+        context.close()
+        return views
+    except Exception as e:
+        logger.warning(f'Anonymous mode failed: {e}')
+        debug_info['anonymous_error'] = str(e)[:200]
+        return 0
+
+
+def scrape_with_playwright(url):
     cookies = parse_netscape_cookies(COOKIES_PATH)
     if not cookies:
         return {'success': False, 'error': 'No cookies loaded'}
@@ -205,12 +346,10 @@ def scrape_with_playwright(url):
             'final_url': '', 'page_title': '',
             'cookies_count': len(cookies),
             'extracted_data': {},
-            'view_extraction_attempts': [],
-            'view_strategies_tried': [],
             'mode_used': '',
             'tried_modes': [],
             'html_search_results': {},
-            'graphql_views_found': [],
+            'view_sources': {},
         }
     }
     
@@ -230,10 +369,23 @@ def scrape_with_playwright(url):
                 ]
             )
             
-            try_desktop_mode(browser, url, cookies, result)
+            # === MODE A: Desktop with cookies (engagement + metadata) ===
+            views_cookies = try_desktop_mode(browser, url, cookies, result)
+            result['debug']['view_sources']['cookies'] = views_cookies
+            
+            # === MODE B: ANONYMOUS (NEW - to get hidden views) ===
+            anonymous_views = scrape_anonymous_for_views(browser, url, result['debug'])
+            result['debug']['view_sources']['anonymous'] = anonymous_views
+            
+            # === MODE C: Mobile m.facebook.com (engagement backup) ===
             try_mobile_mode(browser, url, cookies, result)
             
             browser.close()
+            
+            # COMBINE: Take MAX of all view sources
+            final_views = max(views_cookies, anonymous_views)
+            if final_views > 0:
+                result['data']['views'] = final_views
             
             if (result['data']['views'] > 0 or 
                 result['data']['likes'] > 0 or
@@ -248,11 +400,9 @@ def scrape_with_playwright(url):
 
 
 def try_desktop_mode(browser, url, cookies, result):
-    """Desktop mode - get views (multi-strategy) + metadata"""
-    global captured_responses
-    
+    """Mode A: Desktop with cookies - engagement + metadata. Returns views (may be 0)."""
     try:
-        result['debug']['tried_modes'].append('desktop')
+        result['debug']['tried_modes'].append('desktop_cookies')
         
         context = browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -274,116 +424,29 @@ def try_desktop_mode(browser, url, cookies, result):
             Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
         """)
         
-        # Capture GraphQL responses (Strategy C)
-        def handle_response(response):
-            try:
-                url_lower = response.url.lower()
-                if 'graphql' in url_lower or '/api/graphql' in url_lower or 'video' in url_lower:
-                    if response.status == 200:
-                        try:
-                            body = response.text()
-                            if body and len(body) < 5000000:
-                                captured_responses.append(body)
-                        except:
-                            pass
-            except:
-                pass
-        
-        page.on('response', handle_response)
-        
-        logger.info(f'Desktop navigating to: {url}')
+        logger.info(f'Desktop+cookies navigating to: {url}')
         response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
-        
-        # Wait LONGER (Strategy E)
-        time.sleep(10)
+        time.sleep(7)
         simulate_human(page)
-        time.sleep(3)
-        
-        # Try to play video to trigger view-related JS
-        try:
-            page.evaluate('''
-                const video = document.querySelector('video');
-                if (video) {
-                    video.muted = true;
-                    video.play().catch(() => {});
-                }
-            ''')
-            time.sleep(3)
-        except:
-            pass
+        time.sleep(2)
         
         final_url = page.url
         page_title = page.title()
         result['debug']['final_url'] = final_url
         result['debug']['page_title'] = page_title
-        result['debug']['response_status'] = response.status if response else None
-        result['debug']['network_captures'] = len(captured_responses)
         
         if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
             result['error'] = 'Redirected to login - cookies invalid'
             context.close()
-            return
+            return 0
         
         html = page.content()
         result['debug']['html_length'] = len(html)
         
-        # === STRATEGY A: HTML "lượt xem" pattern (V7.3) ===
-        html_views, view_attempts = search_views_in_html(html)
-        result['debug']['view_extraction_attempts'] = view_attempts
-        if html_views > 0:
-            result['debug']['view_strategies_tried'].append('A_html_luot_xem')
+        # Try to find views
+        views = search_views_in_text(html)
         
-        # === STRATEGY C: GraphQL captured responses ===
-        graphql_views = 0
-        graphql_found = []
-        view_patterns_json = [
-            r'"video_view_count"\s*:\s*(\d+)',
-            r'"play_count"\s*:\s*(\d+)',
-            r'"viewCount"\s*:\s*(\d+)',
-            r'"reels_view_count"\s*:\s*(\d+)',
-            r'"organic_view_count"\s*:\s*(\d+)',
-            r'"unified_view_count_renderer"[^}]*"count"\s*:\s*(\d+)',
-            r'"playbackVideoMetadata"[^}]*"viewCount"\s*:\s*(\d+)',
-        ]
-        
-        for resp_body in captured_responses:
-            for pat in view_patterns_json:
-                matches = re.findall(pat, resp_body)
-                for m in matches:
-                    try:
-                        val = int(m)
-                        if 10 <= val <= 1000000000:
-                            graphql_found.append({'pattern': pat[:30], 'value': val})
-                            if val > graphql_views:
-                                graphql_views = val
-                    except:
-                        pass
-        
-        result['debug']['graphql_views_found'] = graphql_found[:20]
-        if graphql_views > 0:
-            result['debug']['view_strategies_tried'].append('C_graphql')
-        
-        # === STRATEGY D: Search HTML JSON deep patterns ===
-        html_json_views = 0
-        for pat in view_patterns_json:
-            matches = re.findall(pat, html)
-            for m in matches:
-                try:
-                    val = int(m)
-                    if 10 <= val <= 1000000000:
-                        if val > html_json_views:
-                            html_json_views = val
-                except:
-                    pass
-        
-        if html_json_views > 0:
-            result['debug']['view_strategies_tried'].append('D_html_json')
-            result['debug']['html_json_views'] = html_json_views
-        
-        # === COMBINE: take MAX from all strategies ===
-        final_views = max(html_views, graphql_views, html_json_views)
-        
-        # Metadata extraction (with caption fix)
+        # Metadata
         extracted = extract_metadata_from_html(html)
         result['debug']['extracted_data'] = extracted
         
@@ -392,26 +455,19 @@ def try_desktop_mode(browser, url, cookies, result):
         
         result['debug']['html_search_results'] = {
             'has_luot_xem': 'l\u01b0\u1ee3t xem' in html,
-            'has_nguoi_khac': 'ng\u01b0\u1eddi kh\u00e1c' in html,
-            'has_binh_luan': 'b\u00ecnh lu\u1eadn' in html,
-            'has_luot_chia_se': 'l\u01b0\u1ee3t chia s\u1ebb' in html,
             'has_video_view_count': 'video_view_count' in html,
             'has_play_count': 'play_count' in html,
         }
         
-        result['debug']['mode_used'] = 'desktop'
+        result['debug']['mode_used'] = 'desktop_cookies'
         
-        if final_views > 0:
-            result['data']['views'] = final_views
-        
-        # Caption with FIX: increase limit + decode properly + fallback
+        # Caption full
         raw_caption = extracted.get('caption', '')
         if raw_caption:
             decoded = decode_unicode_string(raw_caption)
-            # Increase limit to 5000 chars
             result['data']['caption'] = decoded[:5000]
         
-        # Thumbnail with HTML entity decode
+        # Thumbnail decode
         raw_thumbnail = extracted.get('thumbnail', '')
         if raw_thumbnail:
             result['data']['thumbnail'] = decode_html_entities(raw_thumbnail)
@@ -421,14 +477,16 @@ def try_desktop_mode(browser, url, cookies, result):
         result['data']['video_url'] = final_url
         
         context.close()
+        return views
     except Exception as e:
         logger.warning(f'Desktop mode failed: {e}')
+        return 0
 
 
 def try_mobile_mode(browser, url, cookies, result):
-    """Mobile m.facebook.com for engagement"""
+    """Mode C: Mobile m.facebook.com for engagement"""
     try:
-        result['debug']['tried_modes'].append('mobile')
+        result['debug']['tried_modes'].append('mobile_cookies')
         
         mobile_url = url.replace('www.facebook.com', 'm.facebook.com')
         if 'm.facebook.com' not in mobile_url:
@@ -448,14 +506,14 @@ def try_mobile_mode(browser, url, cookies, result):
         context.add_cookies(cookies)
         page = context.new_page()
         
-        logger.info(f'Mobile navigating to: {mobile_url}')
+        logger.info(f'Mobile+cookies navigating to: {mobile_url}')
         response = page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
-        time.sleep(random.uniform(5, 7))
+        time.sleep(random.uniform(5, 6))
         
-        for offset in [200, 400, 600]:
+        for offset in [200, 400]:
             try:
                 page.evaluate(f'window.scrollTo(0, {offset})')
-                time.sleep(random.uniform(1, 2))
+                time.sleep(random.uniform(0.8, 1.2))
             except:
                 pass
         time.sleep(2)
@@ -468,72 +526,24 @@ def try_mobile_mode(browser, url, cookies, result):
         except:
             pass
         
-        # Engagement from mobile (V7.8 logic)
         engagement = parse_mobile_engagement(mobile_innertext, result['debug'])
         
         if engagement.get('likes', 0) > 0:
             result['data']['likes'] = engagement['likes']
-            result['debug']['mode_used'] = 'desktop+mobile'
         if engagement.get('comments', 0) > 0:
             result['data']['comments'] = engagement['comments']
         if engagement.get('shares', 0) > 0:
             result['data']['shares'] = engagement['shares']
         
-        # Try to find views in mobile too (NEW Strategy B+)
-        if result['data']['views'] == 0:
-            mobile_html = page.content()
-            
-            # Search for "X lượt xem" in mobile HTML
-            view_patterns_mobile = [
-                r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem',
-                r'"play_count"\s*:\s*(\d+)',
-                r'"video_view_count"\s*:\s*(\d+)',
-            ]
-            
-            mobile_view_candidates = []
-            for pat in view_patterns_mobile:
-                matches = re.findall(pat, mobile_html, re.IGNORECASE)
-                for m in matches[:20]:
-                    if pat.startswith('([\\d'):
-                        val = parse_vietnamese_number(m)
-                    else:
-                        try:
-                            val = int(m)
-                        except:
-                            continue
-                    if 10 <= val <= 1000000000:
-                        mobile_view_candidates.append(val)
-            
-            if mobile_view_candidates:
-                result['data']['views'] = max(mobile_view_candidates)
-                result['debug']['view_strategies_tried'].append('B+_mobile_html')
+        # Mobile innertext might also have views
+        if mobile_innertext:
+            mobile_views = search_views_in_text(mobile_innertext)
+            if mobile_views > 0:
+                result['debug']['view_sources']['mobile'] = mobile_views
         
         context.close()
     except Exception as e:
         logger.warning(f'Mobile mode failed: {e}')
-
-
-def search_views_in_html(html):
-    """V7.3 strategy"""
-    view_candidates = []
-    view_attempts = []
-    
-    view_patterns = [
-        r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?)\s*l\\u01b0\\u1ee3t\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?)\s*l\u1ea7n\s*xem',
-    ]
-    
-    for pat in view_patterns:
-        matches = re.findall(pat, html, re.IGNORECASE)
-        for m in matches[:20]:
-            value = parse_vietnamese_number(m)
-            if 10 <= value <= 1000000000:
-                view_candidates.append(value)
-                view_attempts.append({'match': str(m)[:30], 'value': value})
-    
-    final_views = max(view_candidates) if view_candidates else 0
-    return final_views, view_attempts
 
 
 def extract_username_from_dom(page):
@@ -570,7 +580,6 @@ def extract_username_from_dom(page):
 
 
 def extract_metadata_from_html(html):
-    """Extract caption (with fixes), thumbnail, post_id"""
     data = {}
     
     # Post ID
@@ -583,36 +592,30 @@ def extract_metadata_from_html(html):
             data['post_id'] = m.group(1)
             break
     
-    # CAPTION - multiple strategies for full text
+    # Caption - take longest candidate
     caption_candidates = []
     
-    # Strategy 1: og:description (clean, simple)
     m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
     if m:
         caption_candidates.append(m.group(1))
     
-    # Strategy 2: dangerouslySetInnerHTML message text (full caption)
     for pat in [
         r'"message"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)+)"',
         r'"text"\s*:\s*"((?:[^"\\]|\\.)+)"\s*,\s*"is_explicit_locale"',
         r'"description"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)+)"',
-        r'"creation_story"[^}]*"message"[^}]*"text"\s*:\s*"((?:[^"\\]|\\.)+)"',
     ]:
         m = re.search(pat, html)
         if m:
             caption_candidates.append(m.group(1))
     
-    # Pick the LONGEST caption candidate (usually the full one)
     if caption_candidates:
-        # Sort by length, take longest
         caption_candidates.sort(key=len, reverse=True)
         data['caption'] = caption_candidates[0]
     
-    # THUMBNAIL
+    # Thumbnail
     for pat in [
         r'<meta\s+property="og:image"\s+content="([^"]+)"',
         r'"first_frame_thumbnail"\s*:\s*"([^"]+)"',
-        r'"image"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"',
     ]:
         m = re.search(pat, html)
         if m:
@@ -627,7 +630,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '7.9-multi-strategy',
+        'version': '8.0-dual-mode',
     })
 
 
@@ -651,7 +654,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '7.9-multi-strategy',
+        'version': '8.0-dual-mode',
     })
 
 
