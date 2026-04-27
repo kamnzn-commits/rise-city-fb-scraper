@@ -1,26 +1,31 @@
 """
-Rise City Facebook Scraper API - V8.5 🎩 PROFILE VIDEO FALLBACK
-BASE: V8.4
-PATCH MỚI V8.5 (FIX VIEWS=0 CHO PROFILE CÁ NHÂN):
-  - NEW: /videos/[id] URL fallback - sau khi Reel Grid fail
-  - Profile cá nhân (không phải Page) thường lưu video ở /videos/
-    thay vì /reel/. URL này thường có views public.
-  - Logic: Try 2 URL patterns (with/without trailing slash)
-  - Match nhiều patterns: play_count, video_view_count, viewCount,
-    viewer_count, Vietnamese "lượt xem", English "views"
-  
-PATCH V8.4 (giữ nguyên):
-  - REDUCED MODES: 5 → 3 modes
-  - CONCURRENCY LIMIT: max 1 request cùng lúc (semaphore)
-  - ALWAYS RETURN JSON: không bao giờ trả 502 HTML
-  - FORCE GC: garbage collect sau mỗi attempt
+Rise City Facebook Scraper API - V8.6 🎩 LIVE REPLAY DETECTION
+BASE: V8.5
+PATCH MỚI V8.6 (FIX SAI VIEWS CHO LIVE REPLAY):
+  - DETECT LIVE REPLAY: nhận diện video đã từng phát trực tiếp
+  - Markers: was_live_broadcast, broadcast_status VOD_READY,
+    is_live_streaming, live_video_id, /share/v/ URL
+  - LIVE REPLAY KHÔNG dùng play_count (= peak concurrent viewers,
+    số rất lớn ~29K do FB push notify)
+  - LIVE REPLAY dùng: video_view_count, total_view_count,
+    post_view_count, hoặc UI "lượt xem" (lấy số NHỎ NHẤT)
+  - Reel thường giữ nguyên logic V8.5 (dùng play_count)
 
-LOGIC HOÀN CHỈNH V8.5:
+LOGIC CHI TIẾT:
+- Reel (/reel/[id]): play_count = views thực tế ✓
+- Live replay (/share/v/, /videos/): 
+  + play_count = peak concurrent viewers (sai!)
+  + video_view_count = replay views (đúng) ✓
+  + UI "X lượt xem" hiển thị số replay (đúng) ✓
+
+LOGIC HOÀN CHỈNH V8.6:
 1. ATTEMPT 1: Scrape /reel/[id] (3 modes)
 2. NẾU views=0:
    ATTEMPT 2: Reel Grid Scraping
 3. NẾU views VẪN=0:
-   ATTEMPT 3 (V8.5 NEW): /videos/[id] direct URL
+   ATTEMPT 3: /videos/[id] với LIVE DETECTION
+   - Live replay → dùng video_view_count
+   - Reel thường → dùng play_count
 4. NẾU views VẪN=0:
    ATTEMPT 4: VN Residential Proxy fallback
 
@@ -1314,38 +1319,96 @@ def scrape_with_playwright(url):
                                 v85_html = v85_page.content()
                                 result['debug']['videos_url_html_length'] = len(v85_html)
                                 
+                                # === V8.6 NEW: DETECT LIVE REPLAY ===
+                                # Live replay videos có markers khác. play_count = peak concurrent
+                                # viewers (lúc live), KHÔNG phải replay views.
+                                live_markers = [
+                                    '"was_live_broadcast":true',
+                                    '"broadcast_status":"VOD_READY"',
+                                    '"broadcast_status":"LIVE_STOPPED"',
+                                    '"is_live_streaming"',
+                                    '"live_video_id"',
+                                    '"liveBroadcastId"',
+                                    '/share/v/',  # URL pattern cho live replay
+                                ]
+                                is_live_replay = any(marker in v85_html for marker in live_markers)
+                                result['debug']['v86_is_live_replay'] = is_live_replay
+                                result['debug']['v86_live_markers_found'] = [m for m in live_markers if m in v85_html]
+                                
                                 # Try multiple patterns to find views
                                 v85_views = 0
                                 
-                                # Pattern 1: play_count or video_view_count
-                                for pattern in [
-                                    r'"play_count"\s*:\s*(\d+)',
-                                    r'"video_view_count"\s*:\s*(\d+)',
-                                    r'"viewCount"\s*:\s*(\d+)',
-                                    r'"viewer_count"\s*:\s*(\d+)',
-                                ]:
-                                    matches = re.findall(pattern, v85_html)
-                                    if matches:
-                                        v85_views = max(int(m) for m in matches)
-                                        result['debug']['videos_url_match_pattern'] = pattern
-                                        break
-                                
-                                # Pattern 2: Vietnamese "lượt xem" or "views" near number
-                                if v85_views == 0:
-                                    vn_patterns = [
-                                        r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M|nghìn|triệu))?)\s*l[uượ]+t\s*xem',
-                                        r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M))?)\s*views?',
+                                if is_live_replay:
+                                    # === V8.6: LIVE REPLAY - Dùng patterns chính xác cho replay ===
+                                    # KHÔNG dùng play_count (= peak live viewers, không phải replay views)
+                                    logger.info(f'🎩 V8.6: Detected LIVE REPLAY, using replay-specific patterns')
+                                    patterns_to_try = [
+                                        # Replay views (chính xác)
+                                        (r'"video_view_count"\s*:\s*(\d+)', 'video_view_count'),
+                                        (r'"total_view_count"\s*:\s*(\d+)', 'total_view_count'),
+                                        (r'"post_view_count"\s*:\s*(\d+)', 'post_view_count'),
+                                        # Vietnamese "lượt xem" trong UI hiển thị (chính xác nhất)
+                                        # Sẽ xử lý riêng phía dưới
                                     ]
-                                    for vn_pat in vn_patterns:
-                                        vn_matches = re.findall(vn_pat, v85_html, re.IGNORECASE)
-                                        if vn_matches:
-                                            for vn_m in vn_matches:
-                                                parsed = parse_view_count_string(vn_m)
-                                                if parsed > v85_views:
-                                                    v85_views = parsed
-                                            if v85_views > 0:
-                                                result['debug']['videos_url_match_pattern'] = vn_pat
-                                                break
+                                    
+                                    for pattern, field_name in patterns_to_try:
+                                        matches = re.findall(pattern, v85_html)
+                                        if matches:
+                                            # Lấy số NHỎ NHẤT (live có thể có cả peak + replay)
+                                            # Replay views thường nhỏ hơn peak viewers
+                                            v85_views = min(int(m) for m in matches)
+                                            result['debug']['videos_url_match_pattern'] = pattern
+                                            result['debug']['v86_field_used'] = field_name
+                                            logger.info(f'✅ V8.6 LIVE: Got {v85_views} views via {field_name}')
+                                            break
+                                    
+                                    # Fallback: Tìm "X lượt xem" trong UI (thường chính xác)
+                                    if v85_views == 0:
+                                        ui_view_pattern = r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M|nghìn|triệu))?)\s*l[uượ]+t\s*xem'
+                                        ui_matches = re.findall(ui_view_pattern, v85_html, re.IGNORECASE)
+                                        if ui_matches:
+                                            # Lấy số nhỏ nhất (replay) thay vì lớn nhất (live peak)
+                                            parsed_views = []
+                                            for ui_m in ui_matches:
+                                                p = parse_view_count_string(ui_m)
+                                                if p > 0:
+                                                    parsed_views.append(p)
+                                            if parsed_views:
+                                                # Live replay: lấy số NHỎ NHẤT (= replay actual)
+                                                v85_views = min(parsed_views)
+                                                result['debug']['videos_url_match_pattern'] = ui_view_pattern
+                                                result['debug']['v86_field_used'] = 'ui_luot_xem_min'
+                                                logger.info(f'✅ V8.6 LIVE UI: Got {v85_views} views (min of {parsed_views})')
+                                else:
+                                    # === V8.5 LOGIC: Reel thường - dùng play_count ===
+                                    for pattern in [
+                                        r'"play_count"\s*:\s*(\d+)',
+                                        r'"video_view_count"\s*:\s*(\d+)',
+                                        r'"viewCount"\s*:\s*(\d+)',
+                                        r'"viewer_count"\s*:\s*(\d+)',
+                                    ]:
+                                        matches = re.findall(pattern, v85_html)
+                                        if matches:
+                                            v85_views = max(int(m) for m in matches)
+                                            result['debug']['videos_url_match_pattern'] = pattern
+                                            break
+                                    
+                                    # Pattern 2: Vietnamese "lượt xem" or "views" near number
+                                    if v85_views == 0:
+                                        vn_patterns = [
+                                            r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M|nghìn|triệu))?)\s*l[uượ]+t\s*xem',
+                                            r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M))?)\s*views?',
+                                        ]
+                                        for vn_pat in vn_patterns:
+                                            vn_matches = re.findall(vn_pat, v85_html, re.IGNORECASE)
+                                            if vn_matches:
+                                                for vn_m in vn_matches:
+                                                    parsed = parse_view_count_string(vn_m)
+                                                    if parsed > v85_views:
+                                                        v85_views = parsed
+                                                if v85_views > 0:
+                                                    result['debug']['videos_url_match_pattern'] = vn_pat
+                                                    break
                                 
                                 if v85_views > 0:
                                     result['debug']['videos_url_views'] = v85_views
@@ -1640,7 +1703,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.5-profile-video-fallback',
+        'version': '8.6-live-replay-detection',
     })
 
 
@@ -1664,7 +1727,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.5-profile-video-fallback',
+        'version': '8.6-live-replay-detection',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
