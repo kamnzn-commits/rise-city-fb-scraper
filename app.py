@@ -1,29 +1,25 @@
 """
-Rise City Facebook Scraper API - V8.7 🎩 LIVE REPLAY DEBUG MODE
-BASE: V8.6
-PATCH MỚI V8.7 (DEBUG MODE TÌM PATTERN ĐÚNG):
-  - Logging chi tiết TẤT CẢ candidates view count với:
-    + field name (video_view_count, total_view_count, etc.)
-    + value
-    + position trong HTML
-    + distance from post_id
-    + context xung quanh (50 chars trước, 100 sau)
-  - PROXIMITY MATCH: Ưu tiên view count GẦN post_id (trong 1000 chars)
-  - PRIORITY MATCH: Ưu tiên field replay-specific
-  - Fallback: UI "lượt xem" gần post_id nhất
-  - Output debug: v87_post_id_context, v87_all_candidates,
-    v87_ui_luot_xem_matches, v87_final_source
+Rise City Facebook Scraper API - V8.8 🎩 SMART WINDOW MATCH
+BASE: V8.7
+PATCH MỚI V8.8 (FIX TRIỆT ĐỂ LIVE REPLAY VIEWS):
+  KEY INSIGHT từ V8.7 debug:
+  - "play_count" GẦN post_id = views thật UI hiển thị (đúng) ✓
+  - "play_count" XA post_id = peak live viewers (sai) ✗
+  - "video_view_count" = 3-second views (số nhỏ hơn UI)
+  - "play_count_reduced" = "432" → đây là số UI hiển thị ✓
+  
+  V8.8 SMART WINDOW MATCH:
+  1. Tìm post_id position trong HTML
+  2. Lấy candidates trong window [post_id_pos, post_id_pos + 1500]
+  3. Ưu tiên: play_count_reduced > play_count > video_view_count
+  4. Fallback: nearby (< 50000 chars) với cùng priority
+  5. Last fallback: UI "lượt xem" gần nhất
+  
+  Reel thường giữ nguyên logic V8.5 (max play_count)
 
-LOGIC HOÀN CHỈNH V8.7:
-1. ATTEMPT 1: Scrape /reel/[id] (3 modes)
-2. NẾU views=0:
-   ATTEMPT 2: Reel Grid Scraping
-3. NẾU views VẪN=0:
-   ATTEMPT 3: /videos/[id] với LIVE DETECTION + DEBUG
-   - Live replay → smart match (proximity > priority > UI)
-   - Reel thường → dùng play_count
-4. NẾU views VẪN=0:
-   ATTEMPT 4: VN Residential Proxy fallback
+EXPECTED:
+- Video Diệu Nguyễn live (25761): 432 views ✓ (UI confirm)
+- Video Trần Xuân Hậu reel: 6604, 2100, 6600... (giữ nguyên)
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -1335,139 +1331,160 @@ def scrape_with_playwright(url):
                                 v85_views = 0
                                 
                                 if is_live_replay:
-                                    # === V8.7 DEBUG MODE: Log TẤT CẢ candidates ===
-                                    logger.info(f'🎩 V8.7 DEBUG: Detected LIVE REPLAY, đang quét HTML...')
+                                    # === V8.8 SMART MATCH: play_count gần post_id mới đúng ===
+                                    # KEY INSIGHT từ V8.7 debug:
+                                    # - "play_count" GẦN post_id = views thật (UI hiển thị)
+                                    # - "play_count" XA post_id = peak live viewers (sai)
+                                    # - "video_view_count" = 3-second views (số nhỏ hơn, không phải UI)
+                                    logger.info(f'🎩 V8.8: LIVE REPLAY - smart proximity match')
                                     
-                                    # 1. Tìm vị trí post_id trong HTML (để xem context)
-                                    post_id_for_debug = result['data'].get('post_id', '')
-                                    if post_id_for_debug:
-                                        post_id_pos = v85_html.find(f'"{post_id_for_debug}"')
-                                        if post_id_pos > 0:
-                                            ctx_start = max(0, post_id_pos - 300)
-                                            ctx_end = min(len(v85_html), post_id_pos + 800)
-                                            context_str = v85_html[ctx_start:ctx_end]
-                                            # Loại bỏ ký tự đặc biệt cho dễ đọc
-                                            result['debug']['v87_post_id_context'] = context_str[:1500]
-                                            result['debug']['v87_post_id_position'] = post_id_pos
-                                        else:
-                                            result['debug']['v87_post_id_position'] = -1
+                                    # 1. Tìm vị trí post_id
+                                    post_id_for_match = result['data'].get('post_id', '')
+                                    post_id_pos = -1
+                                    if post_id_for_match:
+                                        post_id_pos = v85_html.find(f'"{post_id_for_match}"')
                                     
-                                    # 2. Tìm TẤT CẢ video_view_count với position
-                                    all_view_candidates = []
-                                    
-                                    # Patterns ưu tiên cho live replay
+                                    # 2. Patterns ưu tiên cho LIVE REPLAY
+                                    # play_count_reduced > play_count > video_view_count
+                                    # (play_count_reduced = số UI hiển thị, ưu tiên nhất)
                                     patterns_with_names = [
+                                        (r'"play_count_reduced"\s*:\s*"(\d+)"', 'play_count_reduced'),
+                                        (r'"play_count"\s*:\s*(\d+)', 'play_count'),
                                         (r'"video_view_count"\s*:\s*(\d+)', 'video_view_count'),
                                         (r'"total_view_count"\s*:\s*(\d+)', 'total_view_count'),
                                         (r'"post_view_count"\s*:\s*(\d+)', 'post_view_count'),
-                                        (r'"unique_view_count"\s*:\s*(\d+)', 'unique_view_count'),
-                                        (r'"reduced_view_count"\s*:\s*(\d+)', 'reduced_view_count'),
-                                        (r'"play_count"\s*:\s*(\d+)', 'play_count'),
-                                        (r'"viewCount"\s*:\s*(\d+)', 'viewCount'),
-                                        (r'"actual_view_count"\s*:\s*(\d+)', 'actual_view_count'),
-                                        (r'"vod_view_count"\s*:\s*(\d+)', 'vod_view_count'),
-                                        (r'"replay_view_count"\s*:\s*(\d+)', 'replay_view_count'),
                                     ]
                                     
+                                    # 3. Tìm tất cả candidates với position
+                                    all_candidates = []
                                     for pattern, field_name in patterns_with_names:
                                         for match in re.finditer(pattern, v85_html):
                                             value = int(match.group(1))
                                             position = match.start()
-                                            # Distance from post_id position
-                                            distance = abs(position - post_id_pos) if post_id_pos > 0 else -1
+                                            distance = abs(position - post_id_pos) if post_id_pos > 0 else 999999999
                                             
-                                            # Get context xung quanh match (50 chars trước, 100 sau)
-                                            ctx_pre = v85_html[max(0, position-50):position]
-                                            ctx_post = v85_html[position:min(len(v85_html), position+100)]
+                                            ctx_pre = v85_html[max(0, position-100):position]
+                                            ctx_post = v85_html[position:min(len(v85_html), position+150)]
                                             
-                                            all_view_candidates.append({
+                                            all_candidates.append({
                                                 'field': field_name,
                                                 'value': value,
                                                 'position': position,
-                                                'distance_from_post_id': distance,
-                                                'context_pre': ctx_pre[-50:],
-                                                'context_post': ctx_post[:100],
+                                                'distance': distance,
+                                                'context_pre': ctx_pre[-100:],
+                                                'context_post': ctx_post[:150],
                                             })
                                     
-                                    # Sort by distance from post_id (gần nhất trước)
-                                    if post_id_pos > 0:
-                                        all_view_candidates.sort(key=lambda x: x['distance_from_post_id'])
+                                    result['debug']['v88_total_candidates'] = len(all_candidates)
+                                    result['debug']['v88_post_id_position'] = post_id_pos
                                     
-                                    # Lưu top 20 candidates
-                                    result['debug']['v87_all_candidates'] = all_view_candidates[:20]
-                                    result['debug']['v87_total_candidates_found'] = len(all_view_candidates)
+                                    # 4. SMART MATCH ALGORITHM:
+                                    # Step 1: Tìm "feedback" object chứa post_id
+                                    # FB lưu: ...id:"<post_id>"},...play_count:XXX,..."id":"ZmVlZGJhY2s6<base64>"...
+                                    # base64 của "feedback:<post_id>" → có chứa post_id
                                     
-                                    # 3. Tìm TẤT CẢ "X lượt xem" trong UI text
-                                    ui_view_pattern = r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M|nghìn|triệu))?)\s*l[uượ]+t\s*xem'
-                                    ui_matches_with_pos = []
-                                    for match in re.finditer(ui_view_pattern, v85_html, re.IGNORECASE):
-                                        raw_value = match.group(1)
-                                        parsed_value = parse_view_count_string(raw_value)
-                                        position = match.start()
-                                        distance = abs(position - post_id_pos) if post_id_pos > 0 else -1
-                                        ui_matches_with_pos.append({
-                                            'raw': raw_value,
-                                            'parsed': parsed_value,
-                                            'position': position,
-                                            'distance_from_post_id': distance,
-                                        })
-                                    if post_id_pos > 0:
-                                        ui_matches_with_pos.sort(key=lambda x: x['distance_from_post_id'])
-                                    result['debug']['v87_ui_luot_xem_matches'] = ui_matches_with_pos[:20]
-                                    
-                                    # 4. PROXIMITY MATCH: Tìm view count GẦN post_id (trong 1000 chars)
-                                    v87_proximity_views = 0
-                                    v87_proximity_field = None
-                                    if post_id_pos > 0:
-                                        for cand in all_view_candidates:
-                                            # Chỉ lấy candidate trong vòng 1000 ký tự từ post_id
-                                            if cand['distance_from_post_id'] <= 1000:
-                                                # Skip play_count (sai cho live replay)
-                                                if cand['field'] == 'play_count':
-                                                    continue
-                                                v87_proximity_views = cand['value']
-                                                v87_proximity_field = cand['field']
-                                                logger.info(f'✅ V8.7 PROXIMITY: {cand["field"]}={cand["value"]} '
-                                                          f'(distance={cand["distance_from_post_id"]} from post_id)')
-                                                break
-                                    
-                                    # 5. PRIORITY MATCH BY FIELD NAME (ưu tiên field replay-specific)
-                                    v87_priority_views = 0
-                                    v87_priority_field = None
-                                    for preferred_field in ['video_view_count', 'total_view_count', 
-                                                            'post_view_count', 'unique_view_count']:
-                                        for cand in all_view_candidates:
-                                            if cand['field'] == preferred_field:
-                                                v87_priority_views = cand['value']
-                                                v87_priority_field = preferred_field
-                                                break
-                                        if v87_priority_views > 0:
-                                            break
-                                    
-                                    # 6. Quyết định views cuối cùng
-                                    # Ưu tiên: proximity match (nếu có) > priority field > UI luot_xem
                                     final_views = 0
                                     final_source = 'unknown'
                                     
-                                    if v87_proximity_views > 0:
-                                        final_views = v87_proximity_views
-                                        final_source = f'proximity_{v87_proximity_field}'
-                                    elif v87_priority_views > 0:
-                                        final_views = v87_priority_views
-                                        final_source = f'priority_{v87_priority_field}'
-                                    elif ui_matches_with_pos:
-                                        # Lấy UI match gần nhất
-                                        final_views = ui_matches_with_pos[0]['parsed']
-                                        final_source = 'ui_luot_xem_nearest'
+                                    if post_id_pos > 0:
+                                        # Tìm trong window [post_id_pos, post_id_pos + 1000]
+                                        # Đây là sau post_id, nơi FB lưu play_count cho video này
+                                        window_start = post_id_pos
+                                        window_end = post_id_pos + 1500  # 1500 chars sau post_id
+                                        
+                                        # Lọc candidates trong window
+                                        in_window = [c for c in all_candidates 
+                                                    if window_start <= c['position'] <= window_end]
+                                        
+                                        # Sort by position (gần post_id trước)
+                                        in_window.sort(key=lambda x: x['position'])
+                                        
+                                        result['debug']['v88_in_window_count'] = len(in_window)
+                                        result['debug']['v88_in_window_top5'] = in_window[:5]
+                                        
+                                        # Ưu tiên play_count_reduced (chính xác UI)
+                                        for cand in in_window:
+                                            if cand['field'] == 'play_count_reduced':
+                                                final_views = cand['value']
+                                                final_source = 'window_play_count_reduced'
+                                                logger.info(f'✅ V8.8 WINDOW play_count_reduced: {final_views}')
+                                                break
+                                        
+                                        # Fallback: play_count trong window
+                                        if final_views == 0:
+                                            for cand in in_window:
+                                                if cand['field'] == 'play_count':
+                                                    final_views = cand['value']
+                                                    final_source = 'window_play_count'
+                                                    logger.info(f'✅ V8.8 WINDOW play_count: {final_views}')
+                                                    break
+                                        
+                                        # Fallback: video_view_count trong window
+                                        if final_views == 0:
+                                            for cand in in_window:
+                                                if cand['field'] == 'video_view_count':
+                                                    final_views = cand['value']
+                                                    final_source = 'window_video_view_count'
+                                                    logger.info(f'✅ V8.8 WINDOW video_view_count: {final_views}')
+                                                    break
+                                    
+                                    # 5. NẾU KHÔNG TÌM ĐƯỢC TRONG WINDOW → smart fallback
+                                    if final_views == 0:
+                                        # Lấy candidates SẮP XẾP THEO DISTANCE
+                                        all_candidates.sort(key=lambda x: x['distance'])
+                                        
+                                        # Loại bỏ candidates quá xa (> 50000 chars - chắc chắn là video khác)
+                                        nearby = [c for c in all_candidates if c['distance'] < 50000]
+                                        
+                                        # Ưu tiên play_count_reduced
+                                        for cand in nearby:
+                                            if cand['field'] == 'play_count_reduced':
+                                                final_views = cand['value']
+                                                final_source = 'nearby_play_count_reduced'
+                                                break
+                                        
+                                        if final_views == 0:
+                                            for cand in nearby:
+                                                if cand['field'] == 'play_count':
+                                                    final_views = cand['value']
+                                                    final_source = 'nearby_play_count'
+                                                    break
+                                        
+                                        if final_views == 0:
+                                            for cand in nearby:
+                                                if cand['field'] == 'video_view_count':
+                                                    final_views = cand['value']
+                                                    final_source = 'nearby_video_view_count'
+                                                    break
+                                    
+                                    # 6. UI fallback: tìm "X lượt xem" gần post_id nhất
+                                    if final_views == 0 and post_id_pos > 0:
+                                        ui_pattern = r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M|nghìn|triệu))?)\s*l[uượ]+t\s*xem'
+                                        ui_matches = []
+                                        for match in re.finditer(ui_pattern, v85_html, re.IGNORECASE):
+                                            raw = match.group(1)
+                                            parsed = parse_view_count_string(raw)
+                                            pos = match.start()
+                                            distance = abs(pos - post_id_pos)
+                                            ui_matches.append({
+                                                'parsed': parsed, 
+                                                'position': pos,
+                                                'distance': distance,
+                                                'raw': raw
+                                            })
+                                        if ui_matches:
+                                            ui_matches.sort(key=lambda x: x['distance'])
+                                            final_views = ui_matches[0]['parsed']
+                                            final_source = 'ui_luot_xem_nearest'
                                     
                                     v85_views = final_views
-                                    result['debug']['v87_final_views'] = final_views
-                                    result['debug']['v87_final_source'] = final_source
-                                    result['debug']['videos_url_match_pattern'] = 'v87_smart_match'
+                                    result['debug']['v88_final_views'] = final_views
+                                    result['debug']['v88_final_source'] = final_source
+                                    result['debug']['videos_url_match_pattern'] = 'v88_smart_window'
                                     result['debug']['v86_field_used'] = final_source
                                     
                                     if final_views > 0:
-                                        logger.info(f'✅ V8.7 FINAL: {final_views} views via {final_source}')
+                                        logger.info(f'✅ V8.8 FINAL: {final_views} views via {final_source}')
                                 else:
                                     # === V8.5 LOGIC: Reel thường - dùng play_count ===
                                     for pattern in [
@@ -1792,7 +1809,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.7-live-replay-debug',
+        'version': '8.8-smart-window-match',
     })
 
 
@@ -1816,7 +1833,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.7-live-replay-debug',
+        'version': '8.8-smart-window-match',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
