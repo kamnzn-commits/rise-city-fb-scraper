@@ -708,8 +708,11 @@ def extract_profile_url_from_html(html, debug=None):
 
 def extract_profile_url_from_dom(page, debug=None):
     """
-    V8.3.1: Extract profile URL via JavaScript trong browser DOM.
-    Đáng tin cậy hơn regex vì FB SSR + CSR đã render đầy đủ.
+    V8.3.2: Extract profile URL via JavaScript trong browser DOM.
+    PRIORITY ORDER:
+        1. og:url meta tag (most reliable for FB reel pages)
+        2. Top scored <a> link with avatar/image
+        3. profile.php?id= as last resort
     
     Returns: (profile_url, username) or (None, None)
     """
@@ -781,7 +784,24 @@ def extract_profile_url_from_dom(page, debug=None):
         debug['dom_profile_php_count'] = len(result.get('profile_php_ids', []))
         debug['dom_top_candidates'] = result.get('candidates', [])[:10]
         
-        # Score candidates: prefer ones with avatar/image (likely profile link)
+        # ===== PRIORITY 1: Parse og:url =====
+        # FB embed reel/post URL như:
+        #   https://www.facebook.com/the.mobifone/videos/<slug>/<post_id>/
+        #   https://www.facebook.com/the.mobifone/posts/<id>
+        # Username = path component đầu tiên sau facebook.com/
+        og_url = result.get('og_url') or ''
+        if og_url:
+            # Extract username from og:url path
+            og_match = re.search(r'facebook\.com/([^/?#]+)', og_url)
+            if og_match:
+                og_username = og_match.group(1)
+                # Skip if it's a system path (reel, share, watch, etc.)
+                if og_username.lower() not in USERNAME_BLACKLIST and len(og_username) > 2:
+                    debug['dom_chosen_method'] = 'og_url'
+                    debug['dom_chosen_username'] = og_username
+                    return f'https://www.facebook.com/{og_username}', og_username
+        
+        # ===== PRIORITY 2: Scored candidates with avatar/image =====
         candidates = result.get('candidates', [])
         scored = []
         for c in candidates:
@@ -799,19 +819,23 @@ def extract_profile_url_from_dom(page, debug=None):
         
         scored.sort(key=lambda x: x[0], reverse=True)
         
-        # Return highest-scored candidate
-        if scored:
+        # Only take if score is meaningful (>5, must have image/avatar)
+        if scored and scored[0][0] > 5:
             best = scored[0][1]
             username = best['username']
+            debug['dom_chosen_method'] = 'scored_link'
             debug['dom_chosen_username'] = username
             debug['dom_chosen_score'] = scored[0][0]
             return f'https://www.facebook.com/{username}', username
         
-        # Fallback: profile.php?id=
+        # ===== PRIORITY 3: profile.php?id= (last resort) =====
         if result.get('profile_php_ids'):
             pid = result['profile_php_ids'][0]['id']
+            debug['dom_chosen_method'] = 'profile_php_fallback'
+            debug['dom_chosen_username'] = f'profile.php?id={pid}'
             return f'https://www.facebook.com/profile.php?id={pid}', f'profile.php?id={pid}'
         
+        debug['dom_chosen_method'] = 'none'
         return None, None
     except Exception as e:
         debug['dom_error'] = str(e)[:300]
@@ -1510,7 +1534,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.3.1-dom-grid',
+        'version': '8.3.2-og-url-priority',
     })
 
 
@@ -1534,7 +1558,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.3.1-dom-grid',
+        'version': '8.3.2-og-url-priority',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
