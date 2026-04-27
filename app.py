@@ -1,20 +1,28 @@
 """
-Rise City Facebook Scraper API - V8.4 🎩 OPTIMIZED FOR PRODUCTION
-BASE: V8.3.2
-PATCH MỚI V8.4 (FIX 502 ON RENDER):
-  - REDUCED MODES: 5 → 3 modes (skip mbasic + android_anon - ít hiệu quả)
+Rise City Facebook Scraper API - V8.5 🎩 PROFILE VIDEO FALLBACK
+BASE: V8.4
+PATCH MỚI V8.5 (FIX VIEWS=0 CHO PROFILE CÁ NHÂN):
+  - NEW: /videos/[id] URL fallback - sau khi Reel Grid fail
+  - Profile cá nhân (không phải Page) thường lưu video ở /videos/
+    thay vì /reel/. URL này thường có views public.
+  - Logic: Try 2 URL patterns (with/without trailing slash)
+  - Match nhiều patterns: play_count, video_view_count, viewCount,
+    viewer_count, Vietnamese "lượt xem", English "views"
+  
+PATCH V8.4 (giữ nguyên):
+  - REDUCED MODES: 5 → 3 modes
   - CONCURRENCY LIMIT: max 1 request cùng lúc (semaphore)
-  - ALWAYS RETURN JSON: không bao giờ trả 502 HTML, luôn JSON với error
-  - BETTER ERROR HANDLING: try/except wrap toàn bộ scrape logic
+  - ALWAYS RETURN JSON: không bao giờ trả 502 HTML
   - FORCE GC: garbage collect sau mỗi attempt
-  - GLOBAL TIMEOUT: 90s tổng thời gian xử lý 1 request
 
-LOGIC:
-1. ATTEMPT 1: Scrape /reel/[id] (3 modes: desktop_cookies, iphone15, mobile)
+LOGIC HOÀN CHỈNH V8.5:
+1. ATTEMPT 1: Scrape /reel/[id] (3 modes)
 2. NẾU views=0:
    ATTEMPT 2: Reel Grid Scraping
-3. NẾU views vẫn=0:
-   ATTEMPT 3: VN Residential Proxy fallback
+3. NẾU views VẪN=0:
+   ATTEMPT 3 (V8.5 NEW): /videos/[id] direct URL
+4. NẾU views VẪN=0:
+   ATTEMPT 4: VN Residential Proxy fallback
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -1267,6 +1275,98 @@ def scrape_with_playwright(url):
                 result['debug']['grid_skipped_reason'] = 'views_already_found'
             # === END V8.3 REEL GRID ===
             
+            # === V8.5 NEW: TRY /videos/ DIRECT URL (cho Profile cá nhân) ===
+            # Profile cá nhân (không phải Page) thường lưu video ở /videos/[id]
+            # thay vì /reel/[id]. Try fetch URL này để lấy views.
+            result['debug']['videos_url_attempted'] = False
+            result['debug']['videos_url_views'] = 0
+            
+            if result['data']['views'] == 0:
+                profile_url_v85 = result['debug'].get('dom_profile_url') or result['debug'].get('grid_profile_url')
+                target_post_id_v85 = result['data'].get('post_id')
+                
+                if profile_url_v85 and target_post_id_v85:
+                    # Try multiple URL patterns
+                    urls_to_try = [
+                        f"{profile_url_v85.rstrip('/')}/videos/{target_post_id_v85}",
+                        f"{profile_url_v85.rstrip('/')}/videos/{target_post_id_v85}/",
+                    ]
+                    
+                    for v85_url in urls_to_try:
+                        try:
+                            logger.info(f'🎩 V8.5: Try /videos/ URL: {v85_url}')
+                            result['debug']['videos_url_attempted'] = True
+                            result['debug']['videos_url'] = v85_url
+                            
+                            v85_context = browser.new_context(
+                                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                                viewport={'width': 1366, 'height': 900},
+                                locale='vi-VN',
+                                timezone_id='Asia/Ho_Chi_Minh',
+                            )
+                            v85_context.add_cookies(cookies)
+                            v85_page = v85_context.new_page()
+                            
+                            try:
+                                v85_page.goto(v85_url, wait_until='domcontentloaded', timeout=20000)
+                                v85_page.wait_for_timeout(3000)
+                                
+                                v85_html = v85_page.content()
+                                result['debug']['videos_url_html_length'] = len(v85_html)
+                                
+                                # Try multiple patterns to find views
+                                v85_views = 0
+                                
+                                # Pattern 1: play_count or video_view_count
+                                for pattern in [
+                                    r'"play_count"\s*:\s*(\d+)',
+                                    r'"video_view_count"\s*:\s*(\d+)',
+                                    r'"viewCount"\s*:\s*(\d+)',
+                                    r'"viewer_count"\s*:\s*(\d+)',
+                                ]:
+                                    matches = re.findall(pattern, v85_html)
+                                    if matches:
+                                        v85_views = max(int(m) for m in matches)
+                                        result['debug']['videos_url_match_pattern'] = pattern
+                                        break
+                                
+                                # Pattern 2: Vietnamese "lượt xem" or "views" near number
+                                if v85_views == 0:
+                                    vn_patterns = [
+                                        r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M|nghìn|triệu))?)\s*l[uượ]+t\s*xem',
+                                        r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M))?)\s*views?',
+                                    ]
+                                    for vn_pat in vn_patterns:
+                                        vn_matches = re.findall(vn_pat, v85_html, re.IGNORECASE)
+                                        if vn_matches:
+                                            for vn_m in vn_matches:
+                                                parsed = parse_view_count_string(vn_m)
+                                                if parsed > v85_views:
+                                                    v85_views = parsed
+                                            if v85_views > 0:
+                                                result['debug']['videos_url_match_pattern'] = vn_pat
+                                                break
+                                
+                                if v85_views > 0:
+                                    result['debug']['videos_url_views'] = v85_views
+                                    result['data']['views'] = v85_views
+                                    logger.info(f'✅ V8.5 /videos/ URL fix views=0! Got {v85_views} views from {v85_url}')
+                                    v85_page.close()
+                                    v85_context.close()
+                                    break  # Stop trying other URL patterns
+                            except Exception as goto_err:
+                                logger.warning(f'V8.5 /videos/ URL goto failed: {goto_err}')
+                                result['debug']['videos_url_error'] = str(goto_err)[:200]
+                            
+                            v85_page.close()
+                            v85_context.close()
+                            
+                        except Exception as v85_err:
+                            logger.warning(f'V8.5 /videos/ URL exception: {v85_err}')
+                            result['debug']['videos_url_exception'] = str(v85_err)[:200]
+                            continue
+            # === END V8.5 /videos/ URL FALLBACK ===
+            
             # === V8.2 SMART ROUTING: Retry với VN Proxy nếu views=0 ===
             # IMPORTANT: Phải gọi TRONG `with sync_playwright()` block,
             # pass `p` instance để tránh asyncio loop conflict.
@@ -1540,7 +1640,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.4-optimized',
+        'version': '8.5-profile-video-fallback',
     })
 
 
@@ -1564,7 +1664,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.4-optimized',
+        'version': '8.5-profile-video-fallback',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
