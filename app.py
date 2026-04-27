@@ -1,30 +1,26 @@
 """
-Rise City Facebook Scraper API - V8.6 🎩 LIVE REPLAY DETECTION
-BASE: V8.5
-PATCH MỚI V8.6 (FIX SAI VIEWS CHO LIVE REPLAY):
-  - DETECT LIVE REPLAY: nhận diện video đã từng phát trực tiếp
-  - Markers: was_live_broadcast, broadcast_status VOD_READY,
-    is_live_streaming, live_video_id, /share/v/ URL
-  - LIVE REPLAY KHÔNG dùng play_count (= peak concurrent viewers,
-    số rất lớn ~29K do FB push notify)
-  - LIVE REPLAY dùng: video_view_count, total_view_count,
-    post_view_count, hoặc UI "lượt xem" (lấy số NHỎ NHẤT)
-  - Reel thường giữ nguyên logic V8.5 (dùng play_count)
+Rise City Facebook Scraper API - V8.7 🎩 LIVE REPLAY DEBUG MODE
+BASE: V8.6
+PATCH MỚI V8.7 (DEBUG MODE TÌM PATTERN ĐÚNG):
+  - Logging chi tiết TẤT CẢ candidates view count với:
+    + field name (video_view_count, total_view_count, etc.)
+    + value
+    + position trong HTML
+    + distance from post_id
+    + context xung quanh (50 chars trước, 100 sau)
+  - PROXIMITY MATCH: Ưu tiên view count GẦN post_id (trong 1000 chars)
+  - PRIORITY MATCH: Ưu tiên field replay-specific
+  - Fallback: UI "lượt xem" gần post_id nhất
+  - Output debug: v87_post_id_context, v87_all_candidates,
+    v87_ui_luot_xem_matches, v87_final_source
 
-LOGIC CHI TIẾT:
-- Reel (/reel/[id]): play_count = views thực tế ✓
-- Live replay (/share/v/, /videos/): 
-  + play_count = peak concurrent viewers (sai!)
-  + video_view_count = replay views (đúng) ✓
-  + UI "X lượt xem" hiển thị số replay (đúng) ✓
-
-LOGIC HOÀN CHỈNH V8.6:
+LOGIC HOÀN CHỈNH V8.7:
 1. ATTEMPT 1: Scrape /reel/[id] (3 modes)
 2. NẾU views=0:
    ATTEMPT 2: Reel Grid Scraping
 3. NẾU views VẪN=0:
-   ATTEMPT 3: /videos/[id] với LIVE DETECTION
-   - Live replay → dùng video_view_count
+   ATTEMPT 3: /videos/[id] với LIVE DETECTION + DEBUG
+   - Live replay → smart match (proximity > priority > UI)
    - Reel thường → dùng play_count
 4. NẾU views VẪN=0:
    ATTEMPT 4: VN Residential Proxy fallback
@@ -1339,46 +1335,139 @@ def scrape_with_playwright(url):
                                 v85_views = 0
                                 
                                 if is_live_replay:
-                                    # === V8.6: LIVE REPLAY - Dùng patterns chính xác cho replay ===
-                                    # KHÔNG dùng play_count (= peak live viewers, không phải replay views)
-                                    logger.info(f'🎩 V8.6: Detected LIVE REPLAY, using replay-specific patterns')
-                                    patterns_to_try = [
-                                        # Replay views (chính xác)
+                                    # === V8.7 DEBUG MODE: Log TẤT CẢ candidates ===
+                                    logger.info(f'🎩 V8.7 DEBUG: Detected LIVE REPLAY, đang quét HTML...')
+                                    
+                                    # 1. Tìm vị trí post_id trong HTML (để xem context)
+                                    post_id_for_debug = result['data'].get('post_id', '')
+                                    if post_id_for_debug:
+                                        post_id_pos = v85_html.find(f'"{post_id_for_debug}"')
+                                        if post_id_pos > 0:
+                                            ctx_start = max(0, post_id_pos - 300)
+                                            ctx_end = min(len(v85_html), post_id_pos + 800)
+                                            context_str = v85_html[ctx_start:ctx_end]
+                                            # Loại bỏ ký tự đặc biệt cho dễ đọc
+                                            result['debug']['v87_post_id_context'] = context_str[:1500]
+                                            result['debug']['v87_post_id_position'] = post_id_pos
+                                        else:
+                                            result['debug']['v87_post_id_position'] = -1
+                                    
+                                    # 2. Tìm TẤT CẢ video_view_count với position
+                                    all_view_candidates = []
+                                    
+                                    # Patterns ưu tiên cho live replay
+                                    patterns_with_names = [
                                         (r'"video_view_count"\s*:\s*(\d+)', 'video_view_count'),
                                         (r'"total_view_count"\s*:\s*(\d+)', 'total_view_count'),
                                         (r'"post_view_count"\s*:\s*(\d+)', 'post_view_count'),
-                                        # Vietnamese "lượt xem" trong UI hiển thị (chính xác nhất)
-                                        # Sẽ xử lý riêng phía dưới
+                                        (r'"unique_view_count"\s*:\s*(\d+)', 'unique_view_count'),
+                                        (r'"reduced_view_count"\s*:\s*(\d+)', 'reduced_view_count'),
+                                        (r'"play_count"\s*:\s*(\d+)', 'play_count'),
+                                        (r'"viewCount"\s*:\s*(\d+)', 'viewCount'),
+                                        (r'"actual_view_count"\s*:\s*(\d+)', 'actual_view_count'),
+                                        (r'"vod_view_count"\s*:\s*(\d+)', 'vod_view_count'),
+                                        (r'"replay_view_count"\s*:\s*(\d+)', 'replay_view_count'),
                                     ]
                                     
-                                    for pattern, field_name in patterns_to_try:
-                                        matches = re.findall(pattern, v85_html)
-                                        if matches:
-                                            # Lấy số NHỎ NHẤT (live có thể có cả peak + replay)
-                                            # Replay views thường nhỏ hơn peak viewers
-                                            v85_views = min(int(m) for m in matches)
-                                            result['debug']['videos_url_match_pattern'] = pattern
-                                            result['debug']['v86_field_used'] = field_name
-                                            logger.info(f'✅ V8.6 LIVE: Got {v85_views} views via {field_name}')
+                                    for pattern, field_name in patterns_with_names:
+                                        for match in re.finditer(pattern, v85_html):
+                                            value = int(match.group(1))
+                                            position = match.start()
+                                            # Distance from post_id position
+                                            distance = abs(position - post_id_pos) if post_id_pos > 0 else -1
+                                            
+                                            # Get context xung quanh match (50 chars trước, 100 sau)
+                                            ctx_pre = v85_html[max(0, position-50):position]
+                                            ctx_post = v85_html[position:min(len(v85_html), position+100)]
+                                            
+                                            all_view_candidates.append({
+                                                'field': field_name,
+                                                'value': value,
+                                                'position': position,
+                                                'distance_from_post_id': distance,
+                                                'context_pre': ctx_pre[-50:],
+                                                'context_post': ctx_post[:100],
+                                            })
+                                    
+                                    # Sort by distance from post_id (gần nhất trước)
+                                    if post_id_pos > 0:
+                                        all_view_candidates.sort(key=lambda x: x['distance_from_post_id'])
+                                    
+                                    # Lưu top 20 candidates
+                                    result['debug']['v87_all_candidates'] = all_view_candidates[:20]
+                                    result['debug']['v87_total_candidates_found'] = len(all_view_candidates)
+                                    
+                                    # 3. Tìm TẤT CẢ "X lượt xem" trong UI text
+                                    ui_view_pattern = r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M|nghìn|triệu))?)\s*l[uượ]+t\s*xem'
+                                    ui_matches_with_pos = []
+                                    for match in re.finditer(ui_view_pattern, v85_html, re.IGNORECASE):
+                                        raw_value = match.group(1)
+                                        parsed_value = parse_view_count_string(raw_value)
+                                        position = match.start()
+                                        distance = abs(position - post_id_pos) if post_id_pos > 0 else -1
+                                        ui_matches_with_pos.append({
+                                            'raw': raw_value,
+                                            'parsed': parsed_value,
+                                            'position': position,
+                                            'distance_from_post_id': distance,
+                                        })
+                                    if post_id_pos > 0:
+                                        ui_matches_with_pos.sort(key=lambda x: x['distance_from_post_id'])
+                                    result['debug']['v87_ui_luot_xem_matches'] = ui_matches_with_pos[:20]
+                                    
+                                    # 4. PROXIMITY MATCH: Tìm view count GẦN post_id (trong 1000 chars)
+                                    v87_proximity_views = 0
+                                    v87_proximity_field = None
+                                    if post_id_pos > 0:
+                                        for cand in all_view_candidates:
+                                            # Chỉ lấy candidate trong vòng 1000 ký tự từ post_id
+                                            if cand['distance_from_post_id'] <= 1000:
+                                                # Skip play_count (sai cho live replay)
+                                                if cand['field'] == 'play_count':
+                                                    continue
+                                                v87_proximity_views = cand['value']
+                                                v87_proximity_field = cand['field']
+                                                logger.info(f'✅ V8.7 PROXIMITY: {cand["field"]}={cand["value"]} '
+                                                          f'(distance={cand["distance_from_post_id"]} from post_id)')
+                                                break
+                                    
+                                    # 5. PRIORITY MATCH BY FIELD NAME (ưu tiên field replay-specific)
+                                    v87_priority_views = 0
+                                    v87_priority_field = None
+                                    for preferred_field in ['video_view_count', 'total_view_count', 
+                                                            'post_view_count', 'unique_view_count']:
+                                        for cand in all_view_candidates:
+                                            if cand['field'] == preferred_field:
+                                                v87_priority_views = cand['value']
+                                                v87_priority_field = preferred_field
+                                                break
+                                        if v87_priority_views > 0:
                                             break
                                     
-                                    # Fallback: Tìm "X lượt xem" trong UI (thường chính xác)
-                                    if v85_views == 0:
-                                        ui_view_pattern = r'(\d+(?:[.,]\d+)?(?:\s*(?:K|M|nghìn|triệu))?)\s*l[uượ]+t\s*xem'
-                                        ui_matches = re.findall(ui_view_pattern, v85_html, re.IGNORECASE)
-                                        if ui_matches:
-                                            # Lấy số nhỏ nhất (replay) thay vì lớn nhất (live peak)
-                                            parsed_views = []
-                                            for ui_m in ui_matches:
-                                                p = parse_view_count_string(ui_m)
-                                                if p > 0:
-                                                    parsed_views.append(p)
-                                            if parsed_views:
-                                                # Live replay: lấy số NHỎ NHẤT (= replay actual)
-                                                v85_views = min(parsed_views)
-                                                result['debug']['videos_url_match_pattern'] = ui_view_pattern
-                                                result['debug']['v86_field_used'] = 'ui_luot_xem_min'
-                                                logger.info(f'✅ V8.6 LIVE UI: Got {v85_views} views (min of {parsed_views})')
+                                    # 6. Quyết định views cuối cùng
+                                    # Ưu tiên: proximity match (nếu có) > priority field > UI luot_xem
+                                    final_views = 0
+                                    final_source = 'unknown'
+                                    
+                                    if v87_proximity_views > 0:
+                                        final_views = v87_proximity_views
+                                        final_source = f'proximity_{v87_proximity_field}'
+                                    elif v87_priority_views > 0:
+                                        final_views = v87_priority_views
+                                        final_source = f'priority_{v87_priority_field}'
+                                    elif ui_matches_with_pos:
+                                        # Lấy UI match gần nhất
+                                        final_views = ui_matches_with_pos[0]['parsed']
+                                        final_source = 'ui_luot_xem_nearest'
+                                    
+                                    v85_views = final_views
+                                    result['debug']['v87_final_views'] = final_views
+                                    result['debug']['v87_final_source'] = final_source
+                                    result['debug']['videos_url_match_pattern'] = 'v87_smart_match'
+                                    result['debug']['v86_field_used'] = final_source
+                                    
+                                    if final_views > 0:
+                                        logger.info(f'✅ V8.7 FINAL: {final_views} views via {final_source}')
                                 else:
                                     # === V8.5 LOGIC: Reel thường - dùng play_count ===
                                     for pattern in [
@@ -1703,7 +1792,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.6-live-replay-detection',
+        'version': '8.7-live-replay-debug',
     })
 
 
@@ -1727,7 +1816,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.6-live-replay-detection',
+        'version': '8.7-live-replay-debug',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
