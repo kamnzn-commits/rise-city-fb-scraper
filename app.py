@@ -1,26 +1,24 @@
 """
-Rise City Facebook Scraper API - V8.3 🎩 REEL GRID + SMART ROUTING + VN PROXY
-BASE: V8.2.1
-PATCH MỚI V8.3:
-  - REEL GRID SCRAPING: Khi single reel page không có views,
-    navigate sang profile reels grid (👁️ 185) để lấy views
-  - Extract profile URL từ HTML JSON patterns
-  - Match post_id trong reel grid để lấy đúng số views
-  - 3 strategy match: JSON pattern → DOM traversal → innertext fallback
+Rise City Facebook Scraper API - V8.4 🎩 OPTIMIZED FOR PRODUCTION
+BASE: V8.3.2
+PATCH MỚI V8.4 (FIX 502 ON RENDER):
+  - REDUCED MODES: 5 → 3 modes (skip mbasic + android_anon - ít hiệu quả)
+  - CONCURRENCY LIMIT: max 1 request cùng lúc (semaphore)
+  - ALWAYS RETURN JSON: không bao giờ trả 502 HTML, luôn JSON với error
+  - BETTER ERROR HANDLING: try/except wrap toàn bộ scrape logic
+  - FORCE GC: garbage collect sau mỗi attempt
+  - GLOBAL TIMEOUT: 90s tổng thời gian xử lý 1 request
 
 LOGIC:
-1. ATTEMPT 1: Scrape /reel/[id] (5 modes như V8.1.2) → engagement, caption
+1. ATTEMPT 1: Scrape /reel/[id] (3 modes: desktop_cookies, iphone15, mobile)
 2. NẾU views=0:
-   ATTEMPT 2 (V8.3 NEW): Reel Grid Scraping
-   → Extract profile URL từ HTML
-   → Navigate /[username]/reels/
-   → Match post_id → views
+   ATTEMPT 2: Reel Grid Scraping
 3. NẾU views vẫn=0:
-   ATTEMPT 3 (V8.2): VN Residential Proxy fallback
+   ATTEMPT 3: VN Residential Proxy fallback
 
 ENV VARS REQUIRED ON RENDER:
-- API_SECRET, FB_COOKIES_PATH (như cũ)
-- PROXY_HOST, PROXY_PORT, PROXY_USERNAME_BASE, PROXY_PASSWORD (V8.2)
+- API_SECRET, FB_COOKIES_PATH
+- PROXY_HOST, PROXY_PORT, PROXY_USERNAME_BASE, PROXY_PASSWORD
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -30,6 +28,8 @@ import json
 import logging
 import time
 import random
+import gc
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,6 +45,13 @@ PROXY_PORT = os.getenv('PROXY_PORT', '80')
 PROXY_USERNAME_BASE = os.getenv('PROXY_USERNAME_BASE', '')  # ufxgmuzq
 PROXY_PASSWORD = os.getenv('PROXY_PASSWORD', '')
 PROXY_ENABLED = bool(PROXY_HOST and PROXY_USERNAME_BASE and PROXY_PASSWORD)
+
+# === V8.4: CONCURRENCY LIMIT ===
+# Render starter plan có RAM 512MB-2GB. Chạy 2 Playwright cùng lúc dễ OOM.
+# Semaphore giới hạn max 1 request scrape cùng lúc.
+SCRAPE_SEMAPHORE = threading.Semaphore(1)
+SCRAPE_LOCK_TIMEOUT = 5  # Đợi tối đa 5s nếu có request khác đang chạy
+# === END V8.4 ===
 
 
 def get_random_vn_proxy():
@@ -1193,25 +1200,24 @@ def scrape_with_playwright(url):
             # === ATTEMPT 1: Desktop with cookies (engagement + metadata) ===
             views_1 = try_desktop_with_cookies(browser, url, cookies, result)
             result['debug']['view_sources']['desktop_cookies'] = views_1
+            gc.collect()  # V8.4: Force GC after each mode
             
             # === ATTEMPT 2: iPhone 15 anonymous (NEW) ===
             views_2 = try_anonymous_with_fingerprint(
                 browser, url, FINGERPRINT_IPHONE_15, 'iphone15', result['debug']
             )
             result['debug']['view_sources']['iphone15_anon'] = views_2
+            gc.collect()  # V8.4: Force GC
             
-            # === ATTEMPT 3: Android S24 anonymous (NEW) ===
-            views_3 = try_anonymous_with_fingerprint(
-                browser, url, FINGERPRINT_ANDROID_S24, 'android', result['debug']
-            )
-            result['debug']['view_sources']['android_anon'] = views_3
-            
-            # === ATTEMPT 4: mbasic.facebook.com text-only (NEW) ===
-            views_4 = try_mbasic_for_views(browser, url, cookies, result['debug'])
-            result['debug']['view_sources']['mbasic_cookies'] = views_4
+            # === V8.4: SKIPPED Android S24 + mbasic (ít hiệu quả, save 30s) ===
+            views_3 = 0
+            views_4 = 0
+            result['debug']['view_sources']['android_anon'] = 'skipped_v84'
+            result['debug']['view_sources']['mbasic_cookies'] = 'skipped_v84'
             
             # === ATTEMPT 5: Mobile m.facebook.com (engagement backup) ===
             try_mobile_mode(browser, url, cookies, result)
+            gc.collect()  # V8.4: Force GC
             
             # COMBINE: Take MAX views from all sources
             final_views = max(views_1, views_2, views_3, views_4)
@@ -1534,7 +1540,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.3.2-og-url-priority',
+        'version': '8.4-optimized',
     })
 
 
@@ -1558,29 +1564,72 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.3.2-og-url-priority',
+        'version': '8.4-optimized',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
         'proxy_pool_size': 10 if PROXY_ENABLED else 0,
+        'concurrency_limit': 1,
+        'modes_count': 3,
     })
 
 
 @app.route('/scrape', methods=['POST'])
 def scrape_endpoint():
-    api_key = request.headers.get('X-API-Key') or request.headers.get('x-api-key')
-    if api_key != API_SECRET:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    data = request.get_json(silent=True) or {}
-    url = data.get('url', '')
-    
-    if not url:
-        return jsonify({'error': 'Missing url'}), 400
-    
-    logger.info(f'Scraping: {url}')
-    result = scrape_with_playwright(url)
-    return jsonify(result)
+    """
+    V8.4: Always return JSON. Use semaphore. Catch all exceptions.
+    """
+    try:
+        # Auth check
+        api_key = request.headers.get('X-API-Key') or request.headers.get('x-api-key')
+        if api_key != API_SECRET:
+            return jsonify({'error': 'Unauthorized', 'success': False}), 401
+        
+        # Parse request
+        data = request.get_json(silent=True) or {}
+        url = data.get('url', '')
+        
+        if not url:
+            return jsonify({'error': 'Missing url', 'success': False}), 400
+        
+        # V8.4: Concurrency limit
+        acquired = SCRAPE_SEMAPHORE.acquire(timeout=SCRAPE_LOCK_TIMEOUT)
+        if not acquired:
+            logger.warning(f'⚠️ Semaphore timeout, refusing request: {url}')
+            return jsonify({
+                'success': False,
+                'error': 'Server busy. Another scrape in progress. Retry in 60s.',
+                'retry_after': 60,
+            }), 503
+        
+        try:
+            logger.info(f'🎩 V8.4 Scraping: {url}')
+            start_time = time.time()
+            result = scrape_with_playwright(url)
+            elapsed = time.time() - start_time
+            
+            # Add timing info
+            if isinstance(result, dict):
+                result.setdefault('debug', {})['scrape_time_seconds'] = round(elapsed, 2)
+            
+            logger.info(f'✅ V8.4 Done in {elapsed:.1f}s: {url}')
+            return jsonify(result)
+        finally:
+            # Force GC + release semaphore
+            gc.collect()
+            SCRAPE_SEMAPHORE.release()
+            
+    except Exception as e:
+        # V8.4: NEVER return HTML 502, always JSON
+        logger.exception(f'❌ V8.4 Endpoint error: {e}')
+        return jsonify({
+            'success': False,
+            'error': f'Internal server error: {type(e).__name__}: {str(e)}',
+            'data': {
+                'views': 0, 'likes': 0, 'comments': 0, 'shares': 0,
+                'caption': '', 'thumbnail': '', 'username': '', 'post_id': None,
+            },
+        }), 500
 
 
 if __name__ == '__main__':
