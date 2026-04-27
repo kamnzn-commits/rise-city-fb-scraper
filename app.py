@@ -1,5 +1,5 @@
 """
-Rise City Facebook Scraper API - V8.4 🎩
+Rise City Facebook Scraper API - V8.5 🎩
 ROOT CAUSE FIX: Map icon→field by Unicode codepoint, NOT pattern matching.
 
 Discovery:
@@ -17,7 +17,7 @@ V7.8/V8.1/V8.3 takes [6, 11, 1] as [likes, comments, shares] but actually:
 - "11" = LIKES of reel 2 (different video!)
 - "1" = comments of reel 2
 
-V8.4 Strategy:
+V8.5 Strategy:
 1. Find FIRST occurrence of each icon
 2. Number AFTER icon = value for that field
 3. If NO number after icon → field = 0
@@ -177,7 +177,7 @@ def parse_vietnamese_number(text):
 
 def parse_engagement_v83(innertext, debug_info):
     """
-    V8.4: Icon-specific parsing.
+    V8.5: Icon-specific parsing.
     
     Strategy:
     1. Tokenize innertext into icons and numbers (with positions)
@@ -581,7 +581,7 @@ def try_desktop_with_cookies(browser, url, cookies, result):
 
 
 def try_mobile_mode_v83(browser, url, cookies, result):
-    """V8.4 Mobile mode with icon-specific parsing"""
+    """V8.5 Mobile mode with icon-specific parsing"""
     try:
         result['debug']['tried_modes'].append('mobile_v83')
         
@@ -622,85 +622,169 @@ def try_mobile_mode_v83(browser, url, cookies, result):
         except:
             pass
         
-        # V8.4: Query DOM for view counter via JavaScript
-        # FB renders view count in aria-label or dedicated elements
+        # V8.5: Query DOM for view counter via JavaScript with USERNAME FILTER
+        # Aria-labels contain "Xem video thước phim của {username} có {views} lượt xem"
+        # We need to MATCH username from caption/owner to filter target video
         try:
+            # Get username/owner from page
+            page_username = ''
+            try:
+                # Try to get from URL or DOM
+                page_username = page.evaluate("""
+                    () => {
+                        // Try multiple sources
+                        // 1. og:title meta
+                        const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
+                        // 2. First profile link in page
+                        const profileLink = document.querySelector('a[href*="facebook.com/"]')?.textContent || '';
+                        return ogTitle + '||' + profileLink;
+                    }
+                """)
+            except:
+                pass
+            result['debug']['page_username_hint'] = page_username[:200]
+            
             view_count_dom = page.evaluate("""
                 () => {
                     const results = [];
                     
-                    // Strategy 1: aria-label containing "lượt xem"
-                    const elementsWithAria = document.querySelectorAll('[aria-label*="\u01b0\u1ee3t xem" i], [aria-label*="views" i], [aria-label*="view" i]');
+                    // Strategy 1: aria-label with view counts
+                    // Format: "Xem video thước phim của {USERNAME} có {N} lượt xem"
+                    // Or: "Video has X views"
+                    const elementsWithAria = document.querySelectorAll('[aria-label*="\u01b0\u1ee3t xem" i], [aria-label*="views" i]');
                     elementsWithAria.forEach(el => {
                         const label = el.getAttribute('aria-label') || '';
-                        results.push({source: 'aria-label', text: label});
+                        results.push({source: 'aria-label', text: label, html_class: el.className?.toString()?.substring(0, 80) || ''});
                     });
                     
-                    // Strategy 2: Elements with text containing K view (e.g. "1.3K", "1,3K")
-                    const allTextElements = document.querySelectorAll('span, div');
-                    let count = 0;
-                    for (const el of allTextElements) {
-                        if (count > 50) break;
-                        const text = (el.textContent || '').trim();
-                        // Look for "1.3K", "1,3K", "17K", "830K", "1,3 triệu" formats
-                        if (/^[\\d.,]+\\s*[KMB]\\s*$/i.test(text) || /^[\\d.,]+\\s*tri\u1ec7u$/i.test(text) || /^[\\d.,]+\\s*ngh\u00ecn$/i.test(text)) {
-                            // Check if parent has view-related context
-                            const parent = el.parentElement;
-                            const parentText = parent ? (parent.textContent || '') : '';
-                            const ariaLabel = (parent?.getAttribute('aria-label') || '') + ' ' + 
-                                              (el.getAttribute('aria-label') || '');
-                            if (parentText.includes('xem') || ariaLabel.toLowerCase().includes('view') || 
-                                ariaLabel.includes('xem')) {
-                                results.push({source: 'parent-context', text: text, parent: parentText.substring(0, 100)});
-                                count++;
+                    // Strategy 2: Find video element and inspect siblings/parents
+                    const videoElements = document.querySelectorAll('video');
+                    for (const video of videoElements) {
+                        // Walk up parents looking for view count text
+                        let parent = video.parentElement;
+                        let depth = 0;
+                        while (parent && depth < 6) {
+                            const ariaLabel = parent.getAttribute('aria-label') || '';
+                            if (ariaLabel.includes('\u01b0\u1ee3t xem') || ariaLabel.toLowerCase().includes('view')) {
+                                results.push({source: 'video-parent-aria', text: ariaLabel, depth: depth});
                             }
+                            // Check title attribute
+                            const title = parent.getAttribute('title') || '';
+                            if (title.includes('\u01b0\u1ee3t xem')) {
+                                results.push({source: 'video-parent-title', text: title, depth: depth});
+                            }
+                            parent = parent.parentElement;
+                            depth++;
                         }
                     }
                     
-                    // Strategy 3: Eye icon SVG (view count next to play icon)
-                    // Find the first reel container and look for "play count" patterns
-                    const playContainers = document.querySelectorAll('[role="article"], [data-pagelet*="reel" i]');
-                    for (const container of playContainers) {
-                        if (count > 100) break;
-                        // Find spans containing K or M or triệu numbers in this container
-                        const spans = container.querySelectorAll('span');
-                        for (const span of spans) {
-                            const text = (span.textContent || '').trim();
-                            if (/^[\\d.,]+\\s*[KM]\\s*$/i.test(text) || /^[\\d.,]+\\s*tri\u1ec7u$/i.test(text)) {
-                                results.push({source: 'reel-container', text: text});
-                                count++;
+                    // Strategy 3: Find scripts containing reel data (inline JSON)
+                    const scripts = document.querySelectorAll('script');
+                    for (const script of scripts) {
+                        const content = script.textContent || '';
+                        if (content.length > 500000) continue; // skip huge scripts
+                        
+                        // Look for view count patterns in inline JSON
+                        const patterns = [
+                            /"video_view_count"\\s*:\\s*(\\d+)/g,
+                            /"play_count"\\s*:\\s*(\\d+)/g,
+                            /"reels_video_view_count"\\s*:\\s*(\\d+)/g,
+                            /"viewCount"\\s*:\\s*(\\d+)/g,
+                            /"playCount"\\s*:\\s*(\\d+)/g,
+                            /"organic_view_count_v2"\\s*:\\s*(\\d+)/g,
+                        ];
+                        
+                        for (const pattern of patterns) {
+                            const matches = [...content.matchAll(pattern)];
+                            for (const m of matches.slice(0, 5)) {
+                                const val = parseInt(m[1]);
+                                if (val >= 10 && val <= 1000000000) {
+                                    results.push({source: 'inline-json', text: String(val), pattern: m[0].substring(0, 50)});
+                                }
                             }
                         }
-                        break; // Only first container
                     }
                     
                     return results;
                 }
             """)
-            result['debug']['view_dom_candidates'] = view_count_dom[:20]
+            result['debug']['view_dom_candidates'] = view_count_dom[:30]
             
-            # Parse DOM candidates to find view count
-            if view_count_dom:
-                for cand in view_count_dom:
-                    text = cand.get('text', '')
-                    parsed = parse_vietnamese_number(text)
-                    if 10 <= parsed <= 1000000000:
-                        if cand.get('source') == 'aria-label':
-                            # aria-label like "1,3 nghìn lượt xem" - high confidence
-                            result['data']['views'] = parsed
-                            result['debug']['view_sources']['mobile_aria_label'] = parsed
-                            break
-                        elif result['data']['views'] == 0:
-                            # Other sources - lower confidence
-                            result['data']['views'] = parsed
-                            result['debug']['view_sources']['mobile_dom'] = parsed
+            # Filter aria-labels to find target video
+            # Match by username from caption, or by first non-related-reels match
+            target_video_views = 0
+            
+            # Get caption first chars to match username
+            caption_lower = result['data']['caption'].lower() if result['data']['caption'] else ''
+            
+            # Get the username from page if available  
+            target_usernames = []
+            if page_username:
+                # Extract names that look like usernames
+                names = re.findall(r'([\w\u00C0-\u1EF9]+)', page_username)
+                target_usernames = [n.strip() for n in names if len(n.strip()) > 2][:5]
+            result['debug']['target_username_candidates'] = target_usernames
+            
+            # Process aria-label candidates
+            aria_candidates = [c for c in view_count_dom if c.get('source') == 'aria-label']
+            
+            # Strategy A: inline-json values (highest confidence)
+            json_candidates = [c for c in view_count_dom if c.get('source') == 'inline-json']
+            if json_candidates:
+                # Take the first reasonable JSON value
+                for c in json_candidates:
+                    val = parse_vietnamese_number(c.get('text', ''))
+                    if 10 <= val <= 1000000000:
+                        target_video_views = val
+                        result['debug']['view_sources']['inline_json'] = val
+                        break
+            
+            # Strategy B: video-parent-aria (likely target video)
+            if target_video_views == 0:
+                parent_candidates = [c for c in view_count_dom if c.get('source') == 'video-parent-aria']
+                if parent_candidates:
+                    for c in parent_candidates:
+                        text = c.get('text', '')
+                        # Extract number from "có X lượt xem"
+                        m = re.search(r'c\u00f3\s+([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s+l\u01b0\u1ee3t\s+xem', text)
+                        if m:
+                            val = parse_vietnamese_number(m.group(1))
+                            if 10 <= val <= 1000000000:
+                                target_video_views = val
+                                result['debug']['view_sources']['video_parent_aria'] = val
+                                break
+            
+            # Strategy C: Try aria-label with username matching (filter related reels)
+            if target_video_views == 0 and aria_candidates:
+                # Try to match by username substring in caption
+                # Caption might mention author, e.g. "LOA LOA LOA..." doesn't help
+                # But we can EXCLUDE aria-labels that mention different usernames
+                
+                # Get usernames from aria-labels
+                # Format: "Xem video thước phim của {username} có {views} lượt xem"
+                aria_usernames = []
+                for c in aria_candidates:
+                    text = c.get('text', '')
+                    m = re.search(r'thư\u1edbc phim c\u1ee7a\s+([^\s]+(?:\s+[^\s]+)?(?:\s+[^\s]+)?)\s+c\u00f3', text)
+                    if m:
+                        aria_usernames.append(m.group(1))
+                
+                result['debug']['aria_usernames_found'] = aria_usernames
+                
+                # If we have pageUsername that matches one of aria_usernames, use that view
+                # Otherwise, DO NOT pick any aria-label (they're all related reels)
+                # because target video usually has NO aria-label
+            
+            if target_video_views > 0:
+                if result['data']['views'] == 0:
+                    result['data']['views'] = target_video_views
         except Exception as e:
             logger.warning(f'DOM view query failed: {e}')
         
-        # V8.4: Use icon-specific parser
+        # V8.5: Use icon-specific parser
         parsed = parse_engagement_v83(mobile_innertext, result['debug'])
         
-        # Always set values from V8.4 (they may be 0 which is correct)
+        # Always set values from V8.5 (they may be 0 which is correct)
         result['data']['likes'] = parsed.get('likes', 0)
         result['data']['comments'] = parsed.get('comments', 0)
         result['data']['shares'] = parsed.get('shares', 0)
@@ -708,13 +792,12 @@ def try_mobile_mode_v83(browser, url, cookies, result):
             result['data']['views'] = parsed['views']
             result['debug']['view_sources']['mobile_v83_eye'] = parsed['views']
         
-        # Also search HTML for views as fallback
-        if result['data']['views'] == 0:
-            mobile_html = page.content()
-            html_views = search_views_in_text(mobile_html)
-            if html_views > 0:
-                result['data']['views'] = html_views
-                result['debug']['view_sources']['mobile_html'] = html_views
+        # V8.5: Removed fallback to mobile_html search_views_in_text
+        # because it was picking up views from "Watch more reels" section (related reels)
+        # not the target video. This caused incorrect views (e.g. 8.4M instead of 1.3K).
+        # 
+        # If DOM extraction (above) didn't find target video views, we leave views=0
+        # rather than returning incorrect data from related reels.
         
         context.close()
     except Exception as e:
@@ -802,7 +885,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.4-dom-view-extraction',
+        'version': '8.5-target-only',
     })
 
 
@@ -826,7 +909,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.4-dom-view-extraction',
+        'version': '8.5-target-only',
     })
 
 
