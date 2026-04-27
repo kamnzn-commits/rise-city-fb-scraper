@@ -611,7 +611,7 @@ def try_mbasic_for_views(browser, url, cookies, debug_info):
         return 0
 
 
-def try_vn_proxy_for_views(url, cookies, result):
+def try_vn_proxy_for_views(p, url, cookies, result):
     """
     V8.2 SMART ROUTING: Retry scrape với VN residential proxy 
     để fix views=0 cho video FB ẩn server-side cho datacenter IP.
@@ -619,6 +619,9 @@ def try_vn_proxy_for_views(url, cookies, result):
     - Random rotate qua 10 IP VN: vn-1 → vn-10
     - Chỉ chạy desktop_cookies mode (đỡ tốn bandwidth)
     - Tìm views từ HTML, network responses, mobile innertext
+    
+    NOTE V8.2.1: Nhận playwright instance `p` từ caller để tránh
+    "Sync API inside asyncio loop" error trên Render.
     """
     proxy_config = get_random_vn_proxy()
     if not proxy_config:
@@ -628,92 +631,95 @@ def try_vn_proxy_for_views(url, cookies, result):
     proxy_id = proxy_config.pop('proxy_id', 'unknown')
     result['debug']['proxy_id_used'] = proxy_id
     
+    proxy_browser = None
     try:
-        with sync_playwright() as p:
-            # Launch browser WITH PROXY
-            browser = p.chromium.launch(
-                headless=True,
-                proxy=proxy_config,  # KEY: dùng VN proxy
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-gpu',
-                    '--no-first-run',
-                    '--disable-infobars',
-                ]
-            )
-            
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 1366, 'height': 768},
-                locale='vi-VN',
-                timezone_id='Asia/Ho_Chi_Minh',
-                extra_http_headers={
-                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                }
-            )
-            context.add_cookies(cookies)
-            
-            page = context.new_page()
-            
-            # Track network responses for view counts
-            network_views = []
-            
-            def handle_response(response):
-                try:
-                    if 'graphql' in response.url or 'video' in response.url:
-                        if response.status == 200:
-                            content_type = response.headers.get('content-type', '')
-                            if 'json' in content_type or 'javascript' in content_type:
-                                body = response.text()
-                                if body:
-                                    found = search_views_in_text(body)
-                                    if found > 0:
-                                        network_views.append(found)
-                except Exception:
-                    pass
-            
-            page.on('response', handle_response)
-            
+        # Launch SEPARATE browser instance WITH PROXY
+        # (reuse the same `p` playwright instance to avoid asyncio conflict)
+        proxy_browser = p.chromium.launch(
+            headless=True,
+            proxy=proxy_config,  # KEY: dùng VN proxy
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-gpu',
+                '--no-first-run',
+                '--disable-infobars',
+            ]
+        )
+        
+        context = proxy_browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1366, 'height': 768},
+            locale='vi-VN',
+            timezone_id='Asia/Ho_Chi_Minh',
+            extra_http_headers={
+                'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            }
+        )
+        context.add_cookies(cookies)
+        
+        page = context.new_page()
+        
+        # Track network responses for view counts
+        network_views = []
+        
+        def handle_response(response):
             try:
-                page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                page.wait_for_timeout(3000)
-            except Exception as e:
-                logger.warning(f'VN Proxy: page.goto failed: {e}')
-            
-            html = page.content()
-            
-            try:
-                innertext = page.evaluate('document.body ? document.body.innerText : ""')
+                if 'graphql' in response.url or 'video' in response.url:
+                    if response.status == 200:
+                        content_type = response.headers.get('content-type', '')
+                        if 'json' in content_type or 'javascript' in content_type:
+                            body = response.text()
+                            if body:
+                                found = search_views_in_text(body)
+                                if found > 0:
+                                    network_views.append(found)
             except Exception:
-                innertext = ''
-            
-            result['debug']['proxy_html_length'] = len(html)
-            result['debug']['proxy_innertext_length'] = len(innertext)
-            
-            # Search views in HTML + innertext + network
-            all_text = html + '\n' + innertext
-            html_views = search_views_in_text(all_text)
-            net_views = max(network_views) if network_views else 0
-            
-            result['debug']['proxy_html_views'] = html_views
-            result['debug']['proxy_network_views'] = net_views
-            
-            # ALSO try to update engagement if previous attempts had like=0
-            # (Skip this for now to keep proxy simple, focus only on views)
-            
-            final_proxy_views = max(html_views, net_views)
-            
-            context.close()
-            browser.close()
-            
-            return final_proxy_views
+                pass
+        
+        page.on('response', handle_response)
+        
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            page.wait_for_timeout(3000)
+        except Exception as e:
+            logger.warning(f'VN Proxy: page.goto failed: {e}')
+        
+        html = page.content()
+        
+        try:
+            innertext = page.evaluate('document.body ? document.body.innerText : ""')
+        except Exception:
+            innertext = ''
+        
+        result['debug']['proxy_html_length'] = len(html)
+        result['debug']['proxy_innertext_length'] = len(innertext)
+        
+        # Search views in HTML + innertext + network
+        all_text = html + '\n' + innertext
+        html_views = search_views_in_text(all_text)
+        net_views = max(network_views) if network_views else 0
+        
+        result['debug']['proxy_html_views'] = html_views
+        result['debug']['proxy_network_views'] = net_views
+        
+        final_proxy_views = max(html_views, net_views)
+        
+        context.close()
+        proxy_browser.close()
+        
+        return final_proxy_views
     except Exception as e:
         logger.exception(f'VN Proxy retry failed: {e}')
         result['debug']['proxy_error'] = str(e)[:300]
+        try:
+            if proxy_browser:
+                proxy_browser.close()
+        except Exception:
+            pass
         return 0
 
 
@@ -777,20 +783,20 @@ def scrape_with_playwright(url):
             # === ATTEMPT 5: Mobile m.facebook.com (engagement backup) ===
             try_mobile_mode(browser, url, cookies, result)
             
-            browser.close()
-            
             # COMBINE: Take MAX views from all sources
             final_views = max(views_1, views_2, views_3, views_4)
             if final_views > 0:
                 result['data']['views'] = final_views
             
             # === V8.2 SMART ROUTING: Retry với VN Proxy nếu views=0 ===
+            # IMPORTANT: Phải gọi TRONG `with sync_playwright()` block,
+            # pass `p` instance để tránh asyncio loop conflict.
             result['debug']['proxy_used'] = False
             result['debug']['proxy_views'] = 0
             
             if (result['data']['views'] == 0 and PROXY_ENABLED):
                 logger.info('🎩 Views=0, retry với VN residential proxy...')
-                proxy_views = try_vn_proxy_for_views(url, cookies, result)
+                proxy_views = try_vn_proxy_for_views(p, url, cookies, result)
                 result['debug']['proxy_used'] = True
                 result['debug']['proxy_views'] = proxy_views
                 
@@ -803,6 +809,8 @@ def scrape_with_playwright(url):
             else:
                 result['debug']['proxy_skipped_reason'] = 'views_already_found'
             # === END V8.2 SMART ROUTING ===
+            
+            browser.close()
             
             if (result['data']['views'] > 0 or 
                 result['data']['likes'] > 0 or
@@ -1038,7 +1046,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.2.0-vn-proxy',
+        'version': '8.2.1-vn-proxy-fixed',
     })
 
 
@@ -1062,7 +1070,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.2.0-vn-proxy',
+        'version': '8.2.1-vn-proxy-fixed',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
