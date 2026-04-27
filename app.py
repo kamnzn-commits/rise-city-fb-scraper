@@ -1,25 +1,24 @@
 """
-Rise City Facebook Scraper API - V8.5 🎩
-CAPTURE NETWORK GRAPHQL RESPONSES
+Rise City Facebook Scraper API - V9.0 🎩
+FINAL - TRIỆT ĐỂ 1 PHÁT ĂN LUÔN
 
-ROOT CAUSE (confirmed by debug-html):
-- HTML static KHÔNG có reaction_count, share_count, video_view_count
-- FB load engagement data via ASYNC GraphQL streaming (RelayPrefetchedStreamCache)
-- HTML chỉ có: total_comment_count, metadata (caption, thumbnail, post_id)
-- Likes, shares, views được gửi qua NETWORK RESPONSES sau page render
+SAU 17 VERSIONS, SỰ THẬT:
+- FB KHÔNG GỬI likes/shares/views cho datacenter IP (Render Singapore)
+- HTML chỉ có: caption, thumbnail, post_id, total_comment_count
+- Network responses: KHÔNG có reaction_count, share_count, video_view_count
+- Đây là giới hạn phía Facebook, không phải bug code
 
-V8.5 STRATEGY:
-1. page.on('response') → capture ALL GraphQL network responses
-2. HTML parse → metadata (caption, thumbnail, post_id)
-3. total_comment_count từ HTML (có sẵn)
-4. Network responses → search reaction_count, share_count, video_view_count
-5. Proximity match: chỉ accept data WITHIN 5000 chars of target post_id
+V9.0 STRATEGY:
+- Render: CHỈ lấy METADATA (caption, thumbnail, post_id, username)
+- Engagement (likes, shares, views, comments): để Edge Function gọi Apify
+- Render KHÔNG CỐ lấy engagement nữa → nhanh, ổn định, không sai
+
+SIMPLE. CLEAN. ĐÚNG.
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
 import os
 import re
-import json
 import logging
 import time
 import random
@@ -103,44 +102,6 @@ def parse_netscape_cookies(cookies_path):
     return cookies
 
 
-def parse_number(val):
-    if val is None:
-        return 0
-    if isinstance(val, (int, float)):
-        return int(val)
-    s = str(val).strip()
-    if not s:
-        return 0
-    match = re.match(r'([\d.,]+)\s*([KkMmBbTrtr]+)?', s)
-    if not match:
-        return 0
-    num_str = match.group(1)
-    suffix = match.group(2)
-    if ',' in num_str and '.' in num_str:
-        num_str = num_str.replace(',', '')
-    elif ',' in num_str:
-        parts = num_str.split(',')
-        if len(parts) == 2 and len(parts[1]) == 3:
-            num_str = num_str.replace(',', '')
-        else:
-            num_str = num_str.replace(',', '.')
-    elif '.' in num_str:
-        parts = num_str.split('.')
-        if len(parts) == 2 and len(parts[1]) == 3:
-            num_str = num_str.replace('.', '')
-    try:
-        num = float(num_str)
-    except:
-        return 0
-    if suffix:
-        sl = suffix.lower()
-        if 'k' in sl: num *= 1000
-        elif 'm' in sl: num *= 1000000
-        elif 'b' in sl: num *= 1000000000
-        elif 'tr' in sl: num *= 1000000
-    return int(num)
-
-
 def extract_post_id_from_url(url):
     for pat in [r'/reel/(\d+)', r'/videos/(\d+)', r'video\.php\?v=(\d+)', r'/watch/\?v=(\d+)']:
         m = re.search(pat, url)
@@ -149,21 +110,23 @@ def extract_post_id_from_url(url):
     return None
 
 
-# ==========================================
-# METADATA FROM HTML (always works)
-# ==========================================
-
-def extract_metadata_from_html(html):
-    data = {'caption': '', 'thumbnail': '', 'post_id': None, 'username': ''}
+def extract_metadata_from_html(html, target_post_id):
+    """Extract ONLY metadata from HTML. No engagement."""
+    data = {
+        'caption': '', 'thumbnail': '', 'post_id': None, 'username': '',
+    }
     
     # Post ID
-    for pat in [r'"video_id"\s*:\s*"(\d+)"', r'"post_id"\s*:\s*"(\d+)"', r'"top_level_post_id"\s*:\s*"(\d+)"']:
-        m = re.search(pat, html)
-        if m:
-            data['post_id'] = m.group(1)
-            break
+    if target_post_id:
+        data['post_id'] = target_post_id
+    else:
+        for pat in [r'"video_id"\s*:\s*"(\d+)"', r'"post_id"\s*:\s*"(\d+)"', r'"top_level_post_id"\s*:\s*"(\d+)"']:
+            m = re.search(pat, html)
+            if m:
+                data['post_id'] = m.group(1)
+                break
     
-    # Caption
+    # Caption - take longest
     caption_candidates = []
     m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
     if m:
@@ -177,14 +140,15 @@ def extract_metadata_from_html(html):
             caption_candidates.append(m.group(1))
     if caption_candidates:
         caption_candidates.sort(key=len, reverse=True)
-        data['caption'] = caption_candidates[0]
+        raw = caption_candidates[0]
+        data['caption'] = decode_unicode_string(raw)[:5000]
     
     # Thumbnail
     m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
     if m:
         data['thumbnail'] = decode_html_entities(m.group(1))
     
-    # Username
+    # Username from DOM source
     for pat in [
         r'"name"\s*:\s*"([^"]+)"\s*,\s*"(?:url|profile_url)"',
         r'"owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
@@ -192,179 +156,12 @@ def extract_metadata_from_html(html):
         m = re.search(pat, html)
         if m:
             name = m.group(1)
-            if len(name) > 1 and len(name) < 100 and name.lower() not in USERNAME_BLACKLIST:
+            if 1 < len(name) < 100 and name.lower() not in USERNAME_BLACKLIST:
                 data['username'] = name
                 break
     
     return data
 
-
-# ==========================================
-# ENGAGEMENT FROM HTML (total_comment_count only)
-# ==========================================
-
-def extract_comments_from_html(html, target_post_id):
-    """HTML có total_comment_count - proximity match với post_id"""
-    if not target_post_id:
-        return 0
-    
-    pattern = r'"total_comment_count"\s*:\s*(\d+)'
-    matches = list(re.finditer(pattern, html))
-    
-    if not matches:
-        return 0
-    
-    # Find closest match to target post_id
-    post_positions = [m.start() for m in re.finditer(re.escape(target_post_id), html)]
-    if not post_positions:
-        # Fallback: return first match
-        return int(matches[0].group(1))
-    
-    best_val = 0
-    best_dist = float('inf')
-    for m in matches:
-        val = int(m.group(1))
-        for pp in post_positions:
-            dist = abs(m.start() - pp)
-            if dist < best_dist:
-                best_dist = dist
-                best_val = val
-    
-    return best_val
-
-
-# ==========================================
-# ENGAGEMENT FROM NETWORK RESPONSES (likes, shares, views)
-# ==========================================
-
-def extract_engagement_from_network(captured_bodies, target_post_id, debug_info):
-    """
-    V8.5b CORE: Search captured network responses for engagement data.
-    FB encodes JSON in multiple ways:
-    - Normal: "reaction_count":{"count":43}
-    - Escaped: \"reaction_count\":{\"count\":43}  (inside JSON strings)
-    - Double: \\\"reaction_count\\\":{\\\"count\\\":43} (inside escaped JSON)
-    """
-    result = {'likes': 0, 'shares': 0, 'views': 0, 'comments_net': 0}
-    
-    debug_info['v85_network_bodies'] = len(captured_bodies)
-    debug_info['v85_network_total_size'] = sum(len(b) for b in captured_bodies)
-    
-    likes_candidates = []
-    shares_candidates = []
-    views_candidates = []
-    comments_candidates = []
-    
-    # Keywords to check which bodies have engagement data
-    keyword_hits = []
-    
-    for idx, body in enumerate(captured_bodies):
-        if len(body) < 50:
-            continue
-        
-        # Check if body contains target post_id (normal or escaped)
-        has_target = target_post_id and (
-            target_post_id in body or
-            f'\\"{target_post_id}\\"' in body or
-            f'\\\\\\"{target_post_id}\\\\\\"' in body
-        )
-        
-        # Quick keyword scan for debugging
-        kw_found = []
-        for kw in ['reaction_count', 'share_count', 'video_view_count', 'play_count', 'i18n_reaction_count']:
-            if kw in body:
-                kw_found.append(kw)
-        if kw_found:
-            keyword_hits.append({'body_idx': idx, 'size': len(body), 'keywords': kw_found, 'has_target': has_target})
-        
-        # === LIKES patterns (normal + escaped) ===
-        likes_pats = [
-            r'"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-            r'\\"reaction_count\\":\{\\"count\\":(\d+)',
-            r'\\\\"reaction_count\\\\":\\\\\{\\\\"count\\\\":(\d+)',
-            r'"i18n_reaction_count"\s*:\s*"(\d+)',
-            r'\\"i18n_reaction_count\\":\s*\\"(\d+)',
-            r'"reactors"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-            r'\\"reactors\\":\{\\"count\\":(\d+)',
-        ]
-        for pat in likes_pats:
-            for m in re.finditer(pat, body):
-                val = int(m.group(1))
-                pid_pos = body.find(target_post_id) if target_post_id else -1
-                dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
-                likes_candidates.append({'value': val, 'distance': dist, 'in_target_body': has_target, 'body_idx': idx})
-        
-        # === SHARES patterns ===
-        shares_pats = [
-            r'"share_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-            r'\\"share_count\\":\{\\"count\\":(\d+)',
-            r'"reshare_count"\s*:\s*(\d+)',
-            r'\\"reshare_count\\":(\d+)',
-        ]
-        for pat in shares_pats:
-            for m in re.finditer(pat, body):
-                val = int(m.group(1))
-                pid_pos = body.find(target_post_id) if target_post_id else -1
-                dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
-                shares_candidates.append({'value': val, 'distance': dist, 'in_target_body': has_target, 'body_idx': idx})
-        
-        # === VIEWS patterns ===
-        views_pats = [
-            r'"video_view_count"\s*:\s*(\d+)',
-            r'\\"video_view_count\\":(\d+)',
-            r'"play_count"\s*:\s*(\d+)',
-            r'\\"play_count\\":(\d+)',
-            r'"viewCount"\s*:\s*(\d+)',
-            r'\\"viewCount\\":(\d+)',
-        ]
-        for pat in views_pats:
-            for m in re.finditer(pat, body):
-                val = int(m.group(1))
-                if 10 <= val <= 1000000000:
-                    pid_pos = body.find(target_post_id) if target_post_id else -1
-                    dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
-                    views_candidates.append({'value': val, 'distance': dist, 'in_target_body': has_target, 'body_idx': idx})
-        
-        # === COMMENTS from network ===
-        for pat in [r'"total_comment_count"\s*:\s*(\d+)', r'\\"total_comment_count\\":(\d+)']:
-            for m in re.finditer(pat, body):
-                val = int(m.group(1))
-                pid_pos = body.find(target_post_id) if target_post_id else -1
-                dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
-                comments_candidates.append({'value': val, 'distance': dist, 'in_target_body': has_target})
-    
-    # Pick best candidates: prefer in_target_body=True + closest distance
-    def pick_best(candidates, max_dist=5000):
-        if not candidates:
-            return 0
-        target_cands = [c for c in candidates if c['in_target_body'] and c['distance'] < max_dist]
-        if target_cands:
-            return min(target_cands, key=lambda c: c['distance'])['value']
-        # Fallback: any candidate close enough
-        close_cands = [c for c in candidates if c['distance'] < max_dist]
-        if close_cands:
-            return min(close_cands, key=lambda c: c['distance'])['value']
-        return 0
-    
-    result['likes'] = pick_best(likes_candidates)
-    result['shares'] = pick_best(shares_candidates)
-    result['views'] = pick_best(views_candidates)
-    result['comments_net'] = pick_best(comments_candidates)
-    
-    debug_info['v85_likes_candidates'] = len(likes_candidates)
-    debug_info['v85_shares_candidates'] = len(shares_candidates)
-    debug_info['v85_views_candidates'] = len(views_candidates)
-    debug_info['v85_comments_candidates'] = len(comments_candidates)
-    debug_info['v85_keyword_hits'] = keyword_hits[:10]
-    debug_info['v85_likes_samples'] = [{'val': c['value'], 'dist': c['distance'], 'target': c['in_target_body']} for c in likes_candidates[:5]]
-    debug_info['v85_views_samples'] = [{'val': c['value'], 'dist': c['distance'], 'target': c['in_target_body']} for c in views_candidates[:5]]
-    
-    return result
-
-
-# ==========================================
-# SCRAPE ORCHESTRATOR
-# ==========================================
 
 def scrape_with_playwright(url):
     cookies = parse_netscape_cookies(COOKIES_PATH)
@@ -376,20 +173,15 @@ def scrape_with_playwright(url):
     result = {
         'success': False,
         'data': {
-            'views': 0, 'likes': 0, 'comments': 0, 'shares': 0,
             'caption': '', 'thumbnail': '', 'username': '', 'post_id': None,
-            'video_url': '', 'reactions_breakdown': {},
+            'video_url': '',
         },
         'debug': {
-            'final_url': '', 'page_title': '',
             'cookies_count': len(cookies),
-            'version': '8.5b-wide-capture',
-            'target_post_id_from_url': target_post_id,
+            'version': '9.0-metadata-only',
+            'note': 'V9.0: Render only extracts metadata. Engagement (likes/shares/views) must come from Apify via Edge Function.',
         }
     }
-    
-    # Capture network responses
-    captured_bodies = []
     
     try:
         with sync_playwright() as p:
@@ -410,111 +202,42 @@ def scrape_with_playwright(url):
                 timezone_id='Asia/Ho_Chi_Minh',
                 extra_http_headers={
                     'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 }
             )
             context.add_cookies(cookies)
             page = context.new_page()
             page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
             """)
             
-            # CAPTURE ALL NETWORK RESPONSES (V8.5b: widen filter)
-            def handle_response(resp):
-                try:
-                    ct = resp.headers.get('content-type', '')
-                    url_lower = resp.url.lower()
-                    # Capture EVERYTHING from facebook.com that looks like data
-                    is_fb = 'facebook.com' in url_lower or 'fbcdn.net' in url_lower
-                    is_data = ('json' in ct or 'javascript' in ct or 'text' in ct or
-                               any(k in url_lower for k in ['graphql', 'api', 'ajax', 'relay', 'stream', 'comet']))
-                    if is_fb and is_data and resp.status == 200:
-                        try:
-                            body = resp.text()
-                            if body and 50 < len(body) < 10000000:
-                                captured_bodies.append(body)
-                        except:
-                            pass
-                except:
-                    pass
-            
-            page.on('response', handle_response)
-            
             logger.info(f'Navigating to: {url}')
-            response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
-            
-            # Wait for async streams to arrive
-            time.sleep(10)
-            
-            # Scroll to trigger more data loading
-            try:
-                page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
-                time.sleep(3)
-                page.evaluate('window.scrollTo({top: 0, behavior: "smooth"})')
-                time.sleep(2)
-            except:
-                pass
+            page.goto(url, wait_until='domcontentloaded', timeout=45000)
+            time.sleep(6)
             
             final_url = page.url
-            page_title = page.title()
             result['debug']['final_url'] = final_url
-            result['debug']['page_title'] = page_title
+            result['debug']['page_title'] = page.title()
             
-            if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
-                result['error'] = 'Redirected to login - cookies invalid'
+            if 'login' in final_url.lower():
+                result['error'] = 'Redirected to login'
                 browser.close()
                 return result
             
-            # Get HTML for metadata
             html = page.content()
             result['debug']['html_length'] = len(html)
             
-            # Resolve post_id
             if not target_post_id:
                 target_post_id = extract_post_id_from_url(final_url)
-            if not target_post_id:
-                for pat in [r'"video_id"\s*:\s*"(\d+)"', r'"post_id"\s*:\s*"(\d+)"']:
-                    m = re.search(pat, html)
-                    if m:
-                        target_post_id = m.group(1)
-                        break
             
-            result['debug']['target_post_id'] = target_post_id
+            metadata = extract_metadata_from_html(html, target_post_id)
             
-            # === METADATA FROM HTML ===
-            metadata = extract_metadata_from_html(html)
-            result['data']['post_id'] = metadata['post_id'] or target_post_id
+            result['data']['caption'] = metadata['caption']
+            result['data']['thumbnail'] = metadata['thumbnail']
+            result['data']['username'] = metadata['username']
+            result['data']['post_id'] = metadata['post_id']
             result['data']['video_url'] = final_url
             
-            raw_caption = metadata.get('caption', '')
-            if raw_caption:
-                result['data']['caption'] = decode_unicode_string(raw_caption)[:5000]
-            result['data']['thumbnail'] = metadata.get('thumbnail', '')
-            result['data']['username'] = metadata.get('username', '')
-            
-            # === COMMENTS FROM HTML (reliable) ===
-            html_comments = extract_comments_from_html(html, target_post_id)
-            
-            # === ENGAGEMENT FROM NETWORK (likes, shares, views) ===
-            # Also search HTML as additional "body" (it contains some streamed data)
-            all_bodies = captured_bodies + [html]
-            net_engagement = extract_engagement_from_network(all_bodies, target_post_id, result['debug'])
-            
-            # === COMBINE ===
-            result['data']['likes'] = net_engagement['likes']
-            result['data']['comments'] = max(html_comments, net_engagement['comments_net'])
-            result['data']['shares'] = net_engagement['shares']
-            result['data']['views'] = net_engagement['views']
-            
-            result['debug']['html_comments'] = html_comments
-            result['debug']['net_comments'] = net_engagement['comments_net']
-            
-            if (result['data']['views'] > 0 or
-                result['data']['likes'] > 0 or
-                result['data']['comments'] > 0 or
-                result['data']['caption']):
+            if metadata['caption'] or metadata['thumbnail'] or metadata['post_id']:
                 result['success'] = True
             
             context.close()
@@ -522,7 +245,6 @@ def scrape_with_playwright(url):
     except Exception as e:
         logger.exception('Scrape failed')
         result['error'] = str(e)
-        result['error_type'] = type(e).__name__
     
     return result
 
@@ -532,7 +254,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.5b-wide-capture',
+        'version': '9.0-metadata-only',
     })
 
 
@@ -554,7 +276,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.5b-wide-capture',
+        'version': '9.0-metadata-only',
     })
 
 
