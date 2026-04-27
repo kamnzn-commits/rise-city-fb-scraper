@@ -611,39 +611,211 @@ def try_mbasic_for_views(browser, url, cookies, debug_info):
         return 0
 
 
-def extract_profile_url_from_html(html):
+def extract_profile_url_from_html(html, debug=None):
     """
-    V8.3: Extract profile URL của owner reel từ HTML JSON.
-    FB embed profile URL trong nhiều patterns khác nhau.
+    V8.3.1: Extract profile URL của owner reel từ HTML JSON.
+    Improved với 12+ patterns và debug logging.
+    
+    Args:
+        html: Full HTML từ FB
+        debug: Optional dict để ghi lại debug info
+    
     Returns: (profile_url, username) or (None, None)
     """
-    # Pattern 1: owning_profile or owner with url
-    patterns = [
-        r'"owning_profile"\s*:\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"',
-        r'"creation_story"\s*:\s*\{[^}]*?"actors"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"',
-        r'"video_owner"\s*:\s*\{[^}]*?"profile_url"\s*:\s*"(https?:\\?/\\?/[^"]+?)"',
-        r'"actor"\s*:\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"',
-        r'"profile_picture_for_sticky_bar"\s*:\s*\{[^}]*?"profile_url"\s*:\s*"(https?:\\?/\\?/[^"]+?)"',
+    if debug is None:
+        debug = {}
+    
+    debug['html_size'] = len(html)
+    debug['patterns_tried'] = []
+    debug['matches_found'] = []
+    
+    # === STRATEGY 1: JSON patterns (most reliable when present) ===
+    json_patterns = [
+        ('owning_profile_url', r'"owning_profile"\s*:\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"'),
+        ('creation_story_actor', r'"creation_story"\s*:\s*\{[^}]*?"actors"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"'),
+        ('video_owner_url', r'"video_owner"\s*:\s*\{[^}]*?"(?:profile_url|url)"\s*:\s*"(https?:\\?/\\?/[^"]+?)"'),
+        ('actor_url', r'"actor"\s*:\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"'),
+        ('actors_url', r'"actors"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"'),
+        ('owner_url', r'"owner"\s*:\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"'),
+        ('profile_url_field', r'"profile_url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"'),
+        ('page_url_field', r'"page_url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"'),
+        ('vanity_url', r'"vanity"\s*:\s*"([a-zA-Z0-9.]+)"'),
+        ('username_field', r'"username"\s*:\s*"([a-zA-Z0-9.]+)"'),
     ]
     
-    for pattern in patterns:
+    for name, pattern in json_patterns:
+        debug['patterns_tried'].append(name)
         match = re.search(pattern, html)
         if match:
-            url = match.group(1).replace('\\/', '/')
-            # Extract username from URL
-            user_match = re.search(r'facebook\.com/([^/?]+)', url)
-            if user_match:
-                username = user_match.group(1)
-                if username.lower() not in USERNAME_BLACKLIST:
-                    return url, username
+            raw = match.group(1).replace('\\/', '/')
+            debug['matches_found'].append({'pattern': name, 'raw': raw[:200]})
+            
+            # If pattern returns just username (vanity/username field)
+            if name in ('vanity_url', 'username_field'):
+                if raw and raw.lower() not in USERNAME_BLACKLIST:
+                    return f'https://www.facebook.com/{raw}', raw
+            else:
+                # Extract username from URL
+                user_match = re.search(r'facebook\.com/([^/?#]+)', raw)
+                if user_match:
+                    username = user_match.group(1)
+                    if username and username.lower() not in USERNAME_BLACKLIST:
+                        return raw, username
     
-    # Pattern: profile.php?id=
+    # === STRATEGY 2: profile.php?id= ===
+    debug['patterns_tried'].append('profile_php')
     pid_match = re.search(r'facebook\.com\\?/profile\.php\?id=(\d+)', html)
     if pid_match:
         pid = pid_match.group(1)
+        debug['matches_found'].append({'pattern': 'profile_php', 'raw': pid})
         return f'https://www.facebook.com/profile.php?id={pid}', f'profile.php?id={pid}'
     
+    # === STRATEGY 3: og:url meta tag ===
+    debug['patterns_tried'].append('og_url')
+    og_match = re.search(r'<meta\s+property="og:url"\s+content="([^"]+)"', html)
+    if og_match:
+        og_url = og_match.group(1)
+        debug['matches_found'].append({'pattern': 'og_url', 'raw': og_url[:200]})
+        # Extract username from og_url (might be /reel/<id> or /<username>/...)
+        user_match = re.search(r'facebook\.com/([^/?#]+)', og_url)
+        if user_match:
+            username = user_match.group(1)
+            if username.lower() not in USERNAME_BLACKLIST:
+                return f'https://www.facebook.com/{username}', username
+    
+    # === STRATEGY 4: canonical URL ===
+    debug['patterns_tried'].append('canonical')
+    canon_match = re.search(r'<link\s+rel="canonical"\s+href="([^"]+)"', html)
+    if canon_match:
+        canon_url = canon_match.group(1)
+        debug['matches_found'].append({'pattern': 'canonical', 'raw': canon_url[:200]})
+    
+    # === STRATEGY 5: Username từ thumbnail URL fbcdn pattern ===
+    # FB CDN URL có thể chứa hint về owner
+    
+    # === STRATEGY 6: Find any /<username>/posts/ or /<username>/videos/ ===
+    debug['patterns_tried'].append('username_in_path')
+    # Tìm 5 candidate đầu tiên
+    candidates = re.findall(r'facebook\.com\\?/([a-zA-Z0-9.]+)\\?/(?:posts|videos|reels|photos)\\?/', html[:200000])
+    debug['username_candidates'] = list(set(candidates))[:10]
+    
+    for cand in candidates:
+        if cand.lower() not in USERNAME_BLACKLIST and len(cand) > 2:
+            return f'https://www.facebook.com/{cand}', cand
+    
     return None, None
+
+
+def extract_profile_url_from_dom(page, debug=None):
+    """
+    V8.3.1: Extract profile URL via JavaScript trong browser DOM.
+    Đáng tin cậy hơn regex vì FB SSR + CSR đã render đầy đủ.
+    
+    Returns: (profile_url, username) or (None, None)
+    """
+    if debug is None:
+        debug = {}
+    
+    try:
+        result = page.evaluate(f"""
+            () => {{
+                const blacklist = {list(USERNAME_BLACKLIST)};
+                const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+                
+                // Strategy A: og:url meta tag
+                const ogUrl = document.querySelector('meta[property="og:url"]');
+                let ogUrlContent = ogUrl ? ogUrl.getAttribute('content') : null;
+                
+                // Strategy B: All <a> links pointing to facebook.com
+                const allLinks = document.querySelectorAll('a[href]');
+                const candidates = [];
+                
+                for (const link of allLinks) {{
+                    const href = link.getAttribute('href') || '';
+                    
+                    // Match /username (no slashes after)
+                    let match = href.match(/^(?:https?:\\/\\/(?:www\\.|m\\.|web\\.)?facebook\\.com)?\\/([a-zA-Z0-9.]+)(?:\\/|\\?|$|#)/);
+                    if (match) {{
+                        const username = match[1];
+                        if (!blacklistSet.has(username.toLowerCase()) && username.length > 2) {{
+                            const text = (link.textContent || '').trim();
+                            const hasImg = link.querySelector('img') !== null;
+                            const hasAvatar = link.querySelector('image, svg image, [role="img"]') !== null;
+                            
+                            candidates.push({{
+                                username: username,
+                                href: href,
+                                text: text.substring(0, 100),
+                                has_img: hasImg,
+                                has_avatar: hasAvatar,
+                                aria_label: link.getAttribute('aria-label') || ''
+                            }});
+                        }}
+                    }}
+                }}
+                
+                // Strategy C: profile.php?id=
+                const pidLinks = [];
+                for (const link of allLinks) {{
+                    const href = link.getAttribute('href') || '';
+                    const m = href.match(/profile\\.php\\?id=(\\d+)/);
+                    if (m) {{
+                        pidLinks.push({{
+                            id: m[1],
+                            href: href,
+                            text: (link.textContent || '').trim().substring(0, 100)
+                        }});
+                    }}
+                }}
+                
+                return {{
+                    og_url: ogUrlContent,
+                    candidates: candidates.slice(0, 30),
+                    profile_php_ids: pidLinks.slice(0, 10),
+                }};
+            }}
+        """)
+        
+        debug['dom_og_url'] = result.get('og_url')
+        debug['dom_candidates_count'] = len(result.get('candidates', []))
+        debug['dom_profile_php_count'] = len(result.get('profile_php_ids', []))
+        debug['dom_top_candidates'] = result.get('candidates', [])[:10]
+        
+        # Score candidates: prefer ones with avatar/image (likely profile link)
+        candidates = result.get('candidates', [])
+        scored = []
+        for c in candidates:
+            score = 0
+            if c.get('has_avatar'):
+                score += 10
+            if c.get('has_img'):
+                score += 5
+            if c.get('text') and len(c.get('text')) > 1:
+                score += 3
+            # Prefer shorter, simpler usernames
+            if '.' in c.get('username', ''):
+                score += 2
+            scored.append((score, c))
+        
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Return highest-scored candidate
+        if scored:
+            best = scored[0][1]
+            username = best['username']
+            debug['dom_chosen_username'] = username
+            debug['dom_chosen_score'] = scored[0][0]
+            return f'https://www.facebook.com/{username}', username
+        
+        # Fallback: profile.php?id=
+        if result.get('profile_php_ids'):
+            pid = result['profile_php_ids'][0]['id']
+            return f'https://www.facebook.com/profile.php?id={pid}', f'profile.php?id={pid}'
+        
+        return None, None
+    except Exception as e:
+        debug['dom_error'] = str(e)[:300]
+        return None, None
 
 
 def parse_view_count_string(s):
@@ -1028,19 +1200,30 @@ def scrape_with_playwright(url):
             result['debug']['grid_views'] = 0
             
             if result['data']['views'] == 0:
-                # Read HTML từ desktop attempt để tìm profile URL
-                # (HTML đã được scrape trong try_desktop_with_cookies)
-                desktop_html = result['debug'].get('html_full_for_grid', '')
-                # Fallback: dùng html_length từ debug
+                # V8.3.1: Try DOM-extracted URL first (already obtained in desktop_with_cookies)
+                profile_url = result['debug'].get('dom_profile_url')
+                owner_username = result['debug'].get('dom_profile_username')
+                source = 'dom' if profile_url else None
                 
-                profile_url, owner_username = extract_profile_url_from_html(desktop_html)
+                # Fallback to HTML regex extraction
+                if not profile_url:
+                    desktop_html = result['debug'].get('html_full_for_grid', '')
+                    html_extract_debug = {}
+                    profile_url, owner_username = extract_profile_url_from_html(
+                        desktop_html, html_extract_debug
+                    )
+                    result['debug']['html_profile_extraction'] = html_extract_debug
+                    if profile_url:
+                        source = 'html'
+                
                 result['debug']['grid_profile_url'] = profile_url
                 result['debug']['grid_owner_username'] = owner_username
+                result['debug']['grid_profile_source'] = source
                 
                 target_post_id = result['data'].get('post_id')
                 
                 if profile_url and target_post_id:
-                    logger.info(f'🎩 Views=0, thử Reel Grid: {profile_url}')
+                    logger.info(f'🎩 Views=0, thử Reel Grid: {profile_url} (source: {source})')
                     grid_views = try_reel_grid_for_views(browser, profile_url, target_post_id, result)
                     result['debug']['grid_attempted'] = True
                     result['debug']['grid_views'] = grid_views
@@ -1146,6 +1329,14 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         result['debug']['extracted_data'] = extracted
         
         dom_data = extract_username_from_dom(page)
+        
+        # V8.3.1: Also extract profile URL via DOM (for reel grid scraping)
+        dom_profile_debug = {}
+        dom_profile_url, dom_profile_username = extract_profile_url_from_dom(page, dom_profile_debug)
+        result['debug']['dom_profile_extraction'] = dom_profile_debug
+        if dom_profile_url:
+            result['debug']['dom_profile_url'] = dom_profile_url
+            result['debug']['dom_profile_username'] = dom_profile_username
         
         result['debug']['mode_used'] = 'desktop_cookies'
         
@@ -1319,7 +1510,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.3.0-reel-grid',
+        'version': '8.3.1-dom-grid',
     })
 
 
@@ -1343,7 +1534,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.3.0-reel-grid',
+        'version': '8.3.1-dom-grid',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
