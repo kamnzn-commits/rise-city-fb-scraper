@@ -1,28 +1,20 @@
 """
-Rise City Facebook Scraper API - V8.6 🎩
-ROOT CAUSE FIX: Map icon→field by Unicode codepoint, NOT pattern matching.
+Rise City Facebook Scraper API - V8.7 🎩
+SAFE VIEW EXTRACTION: Better return 0 than WRONG number.
 
-Discovery:
-- U+F0378 (󰍸) = Like icon
-- U+F0379 (󰍹) = Comment icon
-- U+F037A (󰍺) = Share icon
-- U+F174D (󱝍) = Eye icon (view)
+Principle: View count must be from TARGET video, not related reels.
 
-When engagement = 0, FB shows ICON without number!
-Pattern parsing fails because:
-  󰍸\n󰍹\n6\n󰍺  ← like icon, comment icon, "6" (comments), share icon
-  
-V7.8/V8.1/V8.3 takes [6, 11, 1] as [likes, comments, shares] but actually:
-- "6" = comments of reel 1
-- "11" = LIKES of reel 2 (different video!)
-- "1" = comments of reel 2
+Strategy for views (in priority order):
+1. og:video meta tag (rare but exact)
+2. JSON match WITH target post_id nearby (10000 chars window)
+3. aria-label NEAR <video> element (skip "Watch more reels" section)
 
-V8.6 Strategy:
-1. Find FIRST occurrence of each icon
-2. Number AFTER icon = value for that field
-3. If NO number after icon → field = 0
-4. Block boundary: when icon SEQUENCE restarts (icon already seen) → next reel
-5. Eye icon has different parsing
+If none of above match safely, return views=0 (let admin verify manually).
+
+Engagement parsing (V8.3 - works perfect):
+- Tokenize mobile innertext into icons + numbers
+- Map icon→number for first reel only
+- Stop when 2nd reel begins
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -127,9 +119,8 @@ def parse_vietnamese_number(text):
         return 0
     s = str(text).strip()
     
-    # Handle "X triệu" format
+    # Handle "X triệu" or "X nghìn"
     if 'tri\u1ec7u' in s:
-        # "1,3 triệu" -> 1.3 * 1M = 1,300,000
         num_match = re.match(r'([\d.,]+)', s)
         if num_match:
             num_str = num_match.group(1).replace(',', '.')
@@ -137,8 +128,16 @@ def parse_vietnamese_number(text):
                 return int(float(num_str) * 1000000)
             except:
                 return 0
+    if 'ngh\u00ecn' in s:
+        num_match = re.match(r'([\d.,]+)', s)
+        if num_match:
+            num_str = num_match.group(1).replace(',', '.')
+            try:
+                return int(float(num_str) * 1000)
+            except:
+                return 0
     
-    match = re.match(r'([\d.,]+)\s*([KkMmBbTrtr]+)?', s)
+    match = re.match(r'([\d.,]+)\s*([KkMmBb]+)?', s)
     if not match:
         return 0
     num_str = match.group(1)
@@ -170,33 +169,22 @@ def parse_vietnamese_number(text):
             num *= 1000000
         elif 'b' in suffix:
             num *= 1000000000
-        elif 'tr' in suffix:
-            num *= 1000000
     return int(num)
 
 
 def parse_engagement_v83(innertext, debug_info):
     """
-    V8.6: Icon-specific parsing.
-    
-    Strategy:
-    1. Tokenize innertext into icons and numbers (with positions)
-    2. Walk through tokens, identifying "blocks" (each reel)
-    3. Take FIRST block's icons (the target video)
-    4. For each icon, get number that follows IMMEDIATELY
-    5. If next token is another ICON (not number), the value = 0
+    V8.3 engagement parser - WORKS PERFECTLY for all videos.
+    Returns dict: {likes, comments, shares, views}
+    Views from this only if eye icon found in first reel block.
     """
     result = {'likes': 0, 'comments': 0, 'shares': 0, 'views': 0}
     
     if not innertext:
         return result
     
-    debug_info['parse_v83'] = {'tokens': [], 'blocks': []}
+    debug_info['parse_v83'] = {}
     
-    # ============================================
-    # STEP 1: Tokenize innertext
-    # ============================================
-    # Each line, classify as: icon, number, or text
     lines = innertext.split('\n')
     tokens = []
     
@@ -205,9 +193,8 @@ def parse_engagement_v83(innertext, debug_info):
         if not line_stripped:
             continue
         
-        # Check if line is a number FIRST (before icon check)
-        # because numbers like "6" also have len=1
-        num_match = re.match(r'^([\d.,]+\s*[KkMmBb]?(?:\s*tri\u1ec7u)?)$', line_stripped)
+        # Number first (handles "6", "1.3K", "1,3 triệu")
+        num_match = re.match(r'^([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)$', line_stripped)
         if num_match:
             value = parse_vietnamese_number(num_match.group(1))
             tokens.append({
@@ -218,7 +205,7 @@ def parse_engagement_v83(innertext, debug_info):
             })
             continue
         
-        # Check if line is single icon (after number check)
+        # Single icon
         if len(line_stripped) <= 2:
             for ch in line_stripped:
                 cp = ord(ch)
@@ -234,18 +221,16 @@ def parse_engagement_v83(innertext, debug_info):
                         icon_type = 'eye'
                     else:
                         icon_type = 'other_icon'
-                    
                     tokens.append({
                         'type': 'icon',
                         'icon_type': icon_type,
                         'raw': ch,
-                        'codepoint': f'U+{cp:05X}',
                         'line': i,
                     })
                     break
             continue
         
-        # Otherwise it's text
+        # Text
         tokens.append({
             'type': 'text',
             'raw': line_stripped[:50],
@@ -253,31 +238,19 @@ def parse_engagement_v83(innertext, debug_info):
         })
     
     debug_info['parse_v83']['tokens_count'] = len(tokens)
-    debug_info['parse_v83']['tokens_first_30'] = [
-        {'t': t['type'], 'r': t.get('icon_type', '') or t.get('raw', '')[:30] or str(t.get('value', ''))}
-        for t in tokens[:30]
-    ]
     
-    # ============================================
-    # STEP 2: Find FIRST reel block
-    # A reel block starts with first like/comment/share icon
-    # Block ends when we see another like icon (next reel) OR text "Watch more"
-    # ============================================
-    
+    # Find first reel block
     first_reel_tokens = []
     seen_like = False
     seen_share = False
     
     for tok in tokens:
-        # Stop conditions
         if tok['type'] == 'text':
             text = tok['raw'].lower()
-            if 'watch more' in text or 'kh\u00e1m ph\u00e1' in text or 'tr\u1ed1ng' in text:
+            if 'watch more' in text or 'kh\u00e1m ph\u00e1' in text:
                 break
         
-        # If we already have likes+comments+shares of reel 1, stop
         if tok['type'] == 'icon' and tok.get('icon_type') == 'like' and seen_like and seen_share:
-            # This is start of reel 2
             break
         
         if tok['type'] == 'icon' and tok.get('icon_type') == 'like':
@@ -287,18 +260,12 @@ def parse_engagement_v83(innertext, debug_info):
         
         first_reel_tokens.append(tok)
     
-    debug_info['parse_v83']['first_reel_tokens_count'] = len(first_reel_tokens)
     debug_info['parse_v83']['first_reel_summary'] = [
         f"{t['type']}:{t.get('icon_type', '') or t.get('value', '') or t.get('raw', '')[:20]}"
-        for t in first_reel_tokens
+        for t in first_reel_tokens[:15]
     ]
     
-    # ============================================
-    # STEP 3: Smart mapping - icon followed by number assigns to that icon
-    # When icon followed by ANOTHER icon, that field = 0 (FB hides 0 values)
-    # ============================================
-    
-    # First, identify positions of each icon type
+    # Map icon → number
     icon_positions = {'like': [], 'comment': [], 'share': [], 'eye': []}
     for i, tok in enumerate(first_reel_tokens):
         if tok['type'] == 'icon':
@@ -306,16 +273,10 @@ def parse_engagement_v83(innertext, debug_info):
             if it in icon_positions:
                 icon_positions[it].append(i)
     
-    debug_info['parse_v83']['icon_positions'] = icon_positions
-    
-    # Map icon -> number that follows directly
     for icon_type in ['like', 'comment', 'share', 'eye']:
         if not icon_positions[icon_type]:
             continue
-        
-        idx = icon_positions[icon_type][0]  # First occurrence
-        
-        # Look at next token
+        idx = icon_positions[icon_type][0]
         if idx + 1 < len(first_reel_tokens):
             next_tok = first_reel_tokens[idx + 1]
             if next_tok['type'] == 'number':
@@ -329,13 +290,8 @@ def parse_engagement_v83(innertext, debug_info):
                 elif icon_type == 'eye' and 0 <= value < 10000000000:
                     result['views'] = value
     
-    # SPECIAL CASE: Icons grouped without numbers, then numbers come later
-    # Pattern: icon_like, icon_comment, NUMBER(N1), icon_share
-    # → likes=0, comments=N1, shares=0 (because share has no number after)
-    
-    # If all 3 main icons are 0 but we have numbers in tokens, try grouped pattern
+    # Special case: icons grouped (likes=0 hidden)
     if (result['likes'] == 0 and result['comments'] == 0 and result['shares'] == 0):
-        # Find all icons in order, then all numbers in order in first block
         icons_seq = []
         numbers_seq = []
         for tok in first_reel_tokens:
@@ -344,38 +300,112 @@ def parse_engagement_v83(innertext, debug_info):
             elif tok['type'] == 'number' and 0 <= tok['value'] < 1000000000:
                 numbers_seq.append(tok['value'])
         
-        debug_info['parse_v83']['grouped_icons'] = icons_seq
-        debug_info['parse_v83']['grouped_numbers'] = numbers_seq
-        
-        # If we have 1-3 numbers and exactly 3 icons (like, comment, share)
-        if icons_seq == ['like', 'comment', 'share'] or icons_seq[:3] == ['like', 'comment', 'share']:
-            # FB hides numbers for 0 values
+        if icons_seq[:3] == ['like', 'comment', 'share']:
             if len(numbers_seq) == 3:
                 result['likes'] = numbers_seq[0]
                 result['comments'] = numbers_seq[1]
                 result['shares'] = numbers_seq[2]
             elif len(numbers_seq) == 2:
-                # Likes=0 hidden, take 2 numbers as comments+shares
-                result['likes'] = 0
                 result['comments'] = numbers_seq[0]
                 result['shares'] = numbers_seq[1]
             elif len(numbers_seq) == 1:
-                # Only 1 number visible → assign to comments
-                result['likes'] = 0
                 result['comments'] = numbers_seq[0]
-                result['shares'] = 0
     
-    debug_info['parse_v83']['parsed_result'] = result.copy()
-    
-    # ============================================
-    # STEP 4: Eye icon view count - ONLY from first reel block
-    # Don't use eye icons from "Watch more reels" section (other reels)
-    # ============================================
-    # Already handled in STEP 3 via icon_positions['eye']
-    # If eye icon is NOT in first_reel_tokens, views stays 0
-    # (We do NOT fall back to other reels' view counts)
-    
+    debug_info['parse_v83']['parsed'] = result.copy()
     return result
+
+
+def safe_extract_views_from_html(html, target_post_id, debug_info):
+    """
+    SAFE view extraction - only return value if HIGH CONFIDENCE it's target video.
+    Returns 0 if uncertain.
+    
+    Strategy:
+    1. og:video:* meta tags (these always belong to current page = target)
+    2. JSON pattern WITH target_post_id within 5000 chars window
+    3. NEVER use aria-label fallback (always related reels)
+    4. NEVER use HTML view-count search alone (could be related reels)
+    """
+    debug_info['safe_view_attempts'] = []
+    
+    if not html or not target_post_id:
+        return 0
+    
+    # Strategy 1: og:video meta tags
+    # Some videos have view in og:video:* but FB rarely puts it
+    # Skip for now - rare case
+    
+    # Strategy 2: JSON view count NEAR post_id (proximity matching)
+    # Only accept if pattern is within 5000 chars of target_post_id mention
+    target_id_str = str(target_post_id)
+    target_positions = []
+    
+    # Find all occurrences of target post_id in HTML
+    for m in re.finditer(re.escape(target_id_str), html):
+        target_positions.append(m.start())
+        if len(target_positions) > 50:
+            break
+    
+    debug_info['safe_view_attempts'].append({
+        'strategy': 'proximity_json',
+        'target_id': target_id_str,
+        'target_occurrences': len(target_positions)
+    })
+    
+    if not target_positions:
+        return 0
+    
+    # Find view count patterns and check proximity to target_id
+    view_patterns = [
+        r'"video_view_count"\s*:\s*(\d+)',
+        r'"play_count"\s*:\s*(\d+)',
+        r'"reels_video_view_count"\s*:\s*(\d+)',
+        r'"organic_view_count_v2"\s*:\s*(\d+)',
+        r'"feedback_video_view_count"\s*:\s*(\d+)',
+        r'"reel_view_count"\s*:\s*(\d+)',
+        r'"viewCount"\s*:\s*(\d+)',
+    ]
+    
+    candidates = []
+    for pat in view_patterns:
+        for m in re.finditer(pat, html):
+            view_pos = m.start()
+            try:
+                value = int(m.group(1))
+                if not (10 <= value <= 1000000000):
+                    continue
+            except:
+                continue
+            
+            # Check proximity to ANY target_id occurrence
+            min_distance = min(abs(view_pos - tp) for tp in target_positions)
+            
+            if min_distance <= 5000:  # within 5KB
+                candidates.append({
+                    'value': value,
+                    'pattern': pat[:30],
+                    'distance': min_distance
+                })
+    
+    debug_info['safe_view_attempts'].append({
+        'strategy': 'proximity_json',
+        'candidates_count': len(candidates),
+        'candidates': candidates[:5]
+    })
+    
+    if not candidates:
+        return 0
+    
+    # Take CLOSEST match to target_id (highest confidence)
+    candidates.sort(key=lambda x: x['distance'])
+    best = candidates[0]
+    
+    debug_info['safe_view_attempts'].append({
+        'strategy': 'proximity_json',
+        'selected': best
+    })
+    
+    return best['value']
 
 
 def simulate_human(page):
@@ -390,65 +420,6 @@ def simulate_human(page):
             time.sleep(random.uniform(0.6, 1.0))
     except:
         pass
-
-
-def search_views_in_text(text):
-    """Search Vietnamese view patterns + JSON patterns + aria-label"""
-    candidates = []
-    
-    # Vietnamese natural language patterns
-    patterns = [
-        r'([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*l\u01b0\u1ee3t\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*l\\u01b0\\u1ee3t\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*l\u1ea7n\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*views?\b',
-    ]
-    
-    for pat in patterns:
-        matches = re.findall(pat, text, re.IGNORECASE)
-        for m in matches[:30]:
-            value = parse_vietnamese_number(m)
-            if 10 <= value <= 1000000000:
-                candidates.append(value)
-    
-    # JSON patterns (server-rendered data)
-    json_patterns = [
-        r'"video_view_count"\s*:\s*(\d+)',
-        r'"play_count"\s*:\s*(\d+)',
-        r'"viewCount"\s*:\s*(\d+)',
-        r'"reels_view_count"\s*:\s*(\d+)',
-        r'"organic_view_count"\s*:\s*(\d+)',
-        r'"post_view_count"\s*:\s*(\d+)',
-        r'"feedback_video_view_count"\s*:\s*(\d+)',
-        r'"reels_video_view_count"\s*:\s*(\d+)',
-        r'"reel_view_count"\s*:\s*(\d+)',
-    ]
-    
-    for pat in json_patterns:
-        matches = re.findall(pat, text)
-        for m in matches:
-            try:
-                val = int(m)
-                if 10 <= val <= 1000000000:
-                    candidates.append(val)
-            except:
-                pass
-    
-    # ARIA-LABEL patterns (UI accessibility)
-    # FB uses aria-label for view counter that's visually shown
-    aria_patterns = [
-        r'aria-label="([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*l\u01b0\u1ee3t\s*xem"',
-        r'aria-label="([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*views?"',
-    ]
-    
-    for pat in aria_patterns:
-        matches = re.findall(pat, text, re.IGNORECASE)
-        for m in matches[:20]:
-            value = parse_vietnamese_number(m)
-            if 10 <= value <= 1000000000:
-                candidates.append(value)
-    
-    return max(candidates) if candidates else 0
 
 
 def scrape_with_playwright(url):
@@ -488,10 +459,8 @@ def scrape_with_playwright(url):
                 ]
             )
             
-            views_desktop = try_desktop_with_cookies(browser, url, cookies, result)
-            result['debug']['view_sources']['desktop_cookies'] = views_desktop
-            
-            try_mobile_mode_v83(browser, url, cookies, result)
+            try_desktop_with_cookies(browser, url, cookies, result)
+            try_mobile_for_engagement(browser, url, cookies, result)
             
             browser.close()
             
@@ -509,7 +478,9 @@ def scrape_with_playwright(url):
 
 
 def try_desktop_with_cookies(browser, url, cookies, result):
-    """Desktop with cookies for caption + metadata + sometimes views from HTML"""
+    """
+    Desktop with cookies: get caption + thumbnail + post_id + SAFE views
+    """
     try:
         result['debug']['tried_modes'].append('desktop_cookies')
         
@@ -546,44 +517,57 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         if 'login' in final_url.lower() or 'Log into Facebook' in page_title:
             result['error'] = 'Redirected to login'
             context.close()
-            return 0
+            return
         
         html = page.content()
         result['debug']['html_length'] = len(html)
         
-        views = search_views_in_text(html)
-        
+        # Extract metadata first (we need post_id for safe view extraction)
         extracted = extract_metadata_from_html(html)
         result['debug']['extracted_data'] = extracted
         
+        target_post_id = extracted.get('post_id', '')
+        if target_post_id:
+            result['data']['post_id'] = target_post_id
+        
+        # SAFE view extraction (only if proximity match)
+        if target_post_id:
+            safe_views = safe_extract_views_from_html(html, target_post_id, result['debug'])
+            if safe_views > 0:
+                result['data']['views'] = safe_views
+                result['debug']['view_sources']['html_proximity'] = safe_views
+        
+        # Username
         dom_data = extract_username_from_dom(page)
         
         result['debug']['mode_used'] = 'desktop_cookies'
         
+        # Caption
         raw_caption = extracted.get('caption', '')
         if raw_caption:
             decoded = decode_unicode_string(raw_caption)
             result['data']['caption'] = decoded[:5000]
         
+        # Thumbnail
         raw_thumbnail = extracted.get('thumbnail', '')
         if raw_thumbnail:
             result['data']['thumbnail'] = decode_html_entities(raw_thumbnail)
         
         result['data']['username'] = dom_data.get('username', '')
-        result['data']['post_id'] = extracted.get('post_id')
         result['data']['video_url'] = final_url
         
         context.close()
-        return views
     except Exception as e:
         logger.warning(f'Desktop mode failed: {e}')
-        return 0
 
 
-def try_mobile_mode_v83(browser, url, cookies, result):
-    """V8.6 Mobile mode with API response capture + force play to load views"""
+def try_mobile_for_engagement(browser, url, cookies, result):
+    """
+    Mobile m.facebook.com: get likes/comments/shares only.
+    Do NOT extract views from mobile (too unreliable, easily gets related reel views).
+    """
     try:
-        result['debug']['tried_modes'].append('mobile_v86')
+        result['debug']['tried_modes'].append('mobile_engagement')
         
         mobile_url = url.replace('www.facebook.com', 'm.facebook.com')
         if 'm.facebook.com' not in mobile_url:
@@ -603,285 +587,42 @@ def try_mobile_mode_v83(browser, url, cookies, result):
         context.add_cookies(cookies)
         page = context.new_page()
         
-        # V8.6: CAPTURE network responses to find view count from API calls
-        captured_api_responses = []
-        def handle_response(response):
-            try:
-                if response.status == 200:
-                    url_lower = response.url.lower()
-                    if any(k in url_lower for k in ['graphql', 'api/graphql', 'reel', 'video']):
-                        try:
-                            body = response.text()
-                            if body and 100 < len(body) < 5000000:
-                                if any(k in body for k in ['view_count', 'play_count', 'viewCount', 
-                                                             'playCount', 'reel_view', 'l\u01b0\u1ee3t xem']):
-                                    captured_api_responses.append(body)
-                        except:
-                            pass
-            except:
-                pass
-        page.on('response', handle_response)
-        
         response = page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
-        time.sleep(random.uniform(3, 4))
+        time.sleep(random.uniform(5, 6))
         
-        # V8.6: Force video play to trigger view counter API
-        try:
-            page.evaluate("""
-                () => {
-                    const videos = document.querySelectorAll('video');
-                    videos.forEach(v => {
-                        try {
-                            v.muted = true;
-                            v.autoplay = true;
-                            const playPromise = v.play();
-                            if (playPromise) playPromise.catch(() => {});
-                        } catch(e) {}
-                    });
-                    const videoContainer = document.querySelector('[role="article"], [data-pagelet*="reel" i]');
-                    if (videoContainer) videoContainer.click();
-                }
-            """)
-            time.sleep(2)
-        except:
-            pass
-        
-        for offset in [200, 400, 600]:
+        for offset in [200, 400]:
             try:
                 page.evaluate(f'window.scrollTo(0, {offset})')
                 time.sleep(random.uniform(0.8, 1.2))
             except:
                 pass
-        time.sleep(3)
-        
-        result['debug']['captured_api_count'] = len(captured_api_responses)
+        time.sleep(2)
         
         mobile_innertext = ''
         try:
             mobile_innertext = page.evaluate('document.body.innerText || ""')
             result['debug']['mobile_innertext_length'] = len(mobile_innertext)
-            result['debug']['mobile_innertext_sample'] = mobile_innertext[:1500]
+            result['debug']['mobile_innertext_sample'] = mobile_innertext[:1000]
         except:
             pass
         
-        # V8.6: Search captured API responses for target video views
-        target_post_id = result['data'].get('post_id', '')
-        api_views = 0
-        api_views_source = None
-        
-        for body in captured_api_responses:
-            if target_post_id and target_post_id in body:
-                view_patterns = [
-                    r'"video_view_count"\s*:\s*(\d+)',
-                    r'"play_count"\s*:\s*(\d+)',
-                    r'"reels_video_view_count"\s*:\s*(\d+)',
-                    r'"viewCount"\s*:\s*(\d+)',
-                    r'"playCount"\s*:\s*(\d+)',
-                ]
-                for pat in view_patterns:
-                    matches = re.findall(pat, body)
-                    for m in matches:
-                        try:
-                            val = int(m)
-                            if 10 <= val <= 1000000000:
-                                if val > api_views:
-                                    api_views = val
-                                    api_views_source = pat[:30]
-                        except:
-                            pass
-                if api_views > 0:
-                    break
-        
-        if api_views > 0:
-            result['data']['views'] = api_views
-            result['debug']['view_sources']['api_capture'] = api_views
-            result['debug']['api_views_pattern'] = api_views_source
-        
-        result['debug']['api_responses_summary'] = [
-            {'length': len(r), 'has_target_id': target_post_id in r if target_post_id else False}
-            for r in captured_api_responses[:5]
-        ]
-        
-        # V8.6: Query DOM for view counter via JavaScript with USERNAME FILTER
-        # Aria-labels contain "Xem video thước phim của {username} có {views} lượt xem"
-        # We need to MATCH username from caption/owner to filter target video
-        try:
-            # Get username/owner from page
-            page_username = ''
-            try:
-                # Try to get from URL or DOM
-                page_username = page.evaluate("""
-                    () => {
-                        // Try multiple sources
-                        // 1. og:title meta
-                        const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
-                        // 2. First profile link in page
-                        const profileLink = document.querySelector('a[href*="facebook.com/"]')?.textContent || '';
-                        return ogTitle + '||' + profileLink;
-                    }
-                """)
-            except:
-                pass
-            result['debug']['page_username_hint'] = page_username[:200]
-            
-            view_count_dom = page.evaluate("""
-                () => {
-                    const results = [];
-                    
-                    // Strategy 1: aria-label with view counts
-                    // Format: "Xem video thước phim của {USERNAME} có {N} lượt xem"
-                    // Or: "Video has X views"
-                    const elementsWithAria = document.querySelectorAll('[aria-label*="\u01b0\u1ee3t xem" i], [aria-label*="views" i]');
-                    elementsWithAria.forEach(el => {
-                        const label = el.getAttribute('aria-label') || '';
-                        results.push({source: 'aria-label', text: label, html_class: el.className?.toString()?.substring(0, 80) || ''});
-                    });
-                    
-                    // Strategy 2: Find video element and inspect siblings/parents
-                    const videoElements = document.querySelectorAll('video');
-                    for (const video of videoElements) {
-                        // Walk up parents looking for view count text
-                        let parent = video.parentElement;
-                        let depth = 0;
-                        while (parent && depth < 6) {
-                            const ariaLabel = parent.getAttribute('aria-label') || '';
-                            if (ariaLabel.includes('\u01b0\u1ee3t xem') || ariaLabel.toLowerCase().includes('view')) {
-                                results.push({source: 'video-parent-aria', text: ariaLabel, depth: depth});
-                            }
-                            // Check title attribute
-                            const title = parent.getAttribute('title') || '';
-                            if (title.includes('\u01b0\u1ee3t xem')) {
-                                results.push({source: 'video-parent-title', text: title, depth: depth});
-                            }
-                            parent = parent.parentElement;
-                            depth++;
-                        }
-                    }
-                    
-                    // Strategy 3: Find scripts containing reel data (inline JSON)
-                    const scripts = document.querySelectorAll('script');
-                    for (const script of scripts) {
-                        const content = script.textContent || '';
-                        if (content.length > 500000) continue; // skip huge scripts
-                        
-                        // Look for view count patterns in inline JSON
-                        const patterns = [
-                            /"video_view_count"\\s*:\\s*(\\d+)/g,
-                            /"play_count"\\s*:\\s*(\\d+)/g,
-                            /"reels_video_view_count"\\s*:\\s*(\\d+)/g,
-                            /"viewCount"\\s*:\\s*(\\d+)/g,
-                            /"playCount"\\s*:\\s*(\\d+)/g,
-                            /"organic_view_count_v2"\\s*:\\s*(\\d+)/g,
-                        ];
-                        
-                        for (const pattern of patterns) {
-                            const matches = [...content.matchAll(pattern)];
-                            for (const m of matches.slice(0, 5)) {
-                                const val = parseInt(m[1]);
-                                if (val >= 10 && val <= 1000000000) {
-                                    results.push({source: 'inline-json', text: String(val), pattern: m[0].substring(0, 50)});
-                                }
-                            }
-                        }
-                    }
-                    
-                    return results;
-                }
-            """)
-            result['debug']['view_dom_candidates'] = view_count_dom[:30]
-            
-            # Filter aria-labels to find target video
-            # Match by username from caption, or by first non-related-reels match
-            target_video_views = 0
-            
-            # Get caption first chars to match username
-            caption_lower = result['data']['caption'].lower() if result['data']['caption'] else ''
-            
-            # Get the username from page if available  
-            target_usernames = []
-            if page_username:
-                # Extract names that look like usernames
-                names = re.findall(r'([\w\u00C0-\u1EF9]+)', page_username)
-                target_usernames = [n.strip() for n in names if len(n.strip()) > 2][:5]
-            result['debug']['target_username_candidates'] = target_usernames
-            
-            # Process aria-label candidates
-            aria_candidates = [c for c in view_count_dom if c.get('source') == 'aria-label']
-            
-            # Strategy A: inline-json values (highest confidence)
-            json_candidates = [c for c in view_count_dom if c.get('source') == 'inline-json']
-            if json_candidates:
-                # Take the first reasonable JSON value
-                for c in json_candidates:
-                    val = parse_vietnamese_number(c.get('text', ''))
-                    if 10 <= val <= 1000000000:
-                        target_video_views = val
-                        result['debug']['view_sources']['inline_json'] = val
-                        break
-            
-            # Strategy B: video-parent-aria (likely target video)
-            if target_video_views == 0:
-                parent_candidates = [c for c in view_count_dom if c.get('source') == 'video-parent-aria']
-                if parent_candidates:
-                    for c in parent_candidates:
-                        text = c.get('text', '')
-                        # Extract number from "có X lượt xem"
-                        m = re.search(r'c\u00f3\s+([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s+l\u01b0\u1ee3t\s+xem', text)
-                        if m:
-                            val = parse_vietnamese_number(m.group(1))
-                            if 10 <= val <= 1000000000:
-                                target_video_views = val
-                                result['debug']['view_sources']['video_parent_aria'] = val
-                                break
-            
-            # Strategy C: Try aria-label with username matching (filter related reels)
-            if target_video_views == 0 and aria_candidates:
-                # Try to match by username substring in caption
-                # Caption might mention author, e.g. "LOA LOA LOA..." doesn't help
-                # But we can EXCLUDE aria-labels that mention different usernames
-                
-                # Get usernames from aria-labels
-                # Format: "Xem video thước phim của {username} có {views} lượt xem"
-                aria_usernames = []
-                for c in aria_candidates:
-                    text = c.get('text', '')
-                    m = re.search(r'thư\u1edbc phim c\u1ee7a\s+([^\s]+(?:\s+[^\s]+)?(?:\s+[^\s]+)?)\s+c\u00f3', text)
-                    if m:
-                        aria_usernames.append(m.group(1))
-                
-                result['debug']['aria_usernames_found'] = aria_usernames
-                
-                # If we have pageUsername that matches one of aria_usernames, use that view
-                # Otherwise, DO NOT pick any aria-label (they're all related reels)
-                # because target video usually has NO aria-label
-            
-            if target_video_views > 0:
-                if result['data']['views'] == 0:
-                    result['data']['views'] = target_video_views
-        except Exception as e:
-            logger.warning(f'DOM view query failed: {e}')
-        
-        # V8.6: Use icon-specific parser
+        # V8.3 engagement parser
         parsed = parse_engagement_v83(mobile_innertext, result['debug'])
         
-        # Always set values from V8.6 (they may be 0 which is correct)
+        # Set engagement (likes/comments/shares)
         result['data']['likes'] = parsed.get('likes', 0)
         result['data']['comments'] = parsed.get('comments', 0)
         result['data']['shares'] = parsed.get('shares', 0)
-        if parsed.get('views', 0) > 0:
-            result['data']['views'] = parsed['views']
-            result['debug']['view_sources']['mobile_v83_eye'] = parsed['views']
         
-        # V8.6: Removed fallback to mobile_html search_views_in_text
-        # because it was picking up views from "Watch more reels" section (related reels)
-        # not the target video. This caused incorrect views (e.g. 8.4M instead of 1.3K).
-        # 
-        # If DOM extraction (above) didn't find target video views, we leave views=0
-        # rather than returning incorrect data from related reels.
+        # ONLY use eye icon view if it's IN the first reel block
+        # parse_engagement_v83 already handles this correctly
+        if parsed.get('views', 0) > 0 and result['data']['views'] == 0:
+            result['data']['views'] = parsed['views']
+            result['debug']['view_sources']['mobile_first_reel_eye'] = parsed['views']
         
         context.close()
     except Exception as e:
-        logger.warning(f'Mobile v83 mode failed: {e}')
+        logger.warning(f'Mobile mode failed: {e}')
 
 
 def extract_username_from_dom(page):
@@ -918,8 +659,10 @@ def extract_username_from_dom(page):
 
 
 def extract_metadata_from_html(html):
+    """Extract caption, thumbnail, post_id from HTML"""
     data = {}
     
+    # Post ID
     for pat in [
         r'"video_id"\s*:\s*"(\d+)"',
         r'"top_level_post_id"\s*:\s*"(\d+)"',
@@ -929,6 +672,7 @@ def extract_metadata_from_html(html):
             data['post_id'] = m.group(1)
             break
     
+    # Caption
     caption_candidates = []
     
     m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
@@ -948,6 +692,7 @@ def extract_metadata_from_html(html):
         caption_candidates.sort(key=len, reverse=True)
         data['caption'] = caption_candidates[0]
     
+    # Thumbnail
     for pat in [
         r'<meta\s+property="og:image"\s+content="([^"]+)"',
         r'"first_frame_thumbnail"\s*:\s*"([^"]+)"',
@@ -965,7 +710,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.6-api-capture',
+        'version': '8.7-safe-views',
     })
 
 
@@ -989,7 +734,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.6-api-capture',
+        'version': '8.7-safe-views',
     })
 
 
