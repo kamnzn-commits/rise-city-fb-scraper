@@ -1,5 +1,5 @@
 """
-Rise City Facebook Scraper API - V8.5 🎩
+Rise City Facebook Scraper API - V8.6 🎩
 ROOT CAUSE FIX: Map icon→field by Unicode codepoint, NOT pattern matching.
 
 Discovery:
@@ -17,7 +17,7 @@ V7.8/V8.1/V8.3 takes [6, 11, 1] as [likes, comments, shares] but actually:
 - "11" = LIKES of reel 2 (different video!)
 - "1" = comments of reel 2
 
-V8.5 Strategy:
+V8.6 Strategy:
 1. Find FIRST occurrence of each icon
 2. Number AFTER icon = value for that field
 3. If NO number after icon → field = 0
@@ -177,7 +177,7 @@ def parse_vietnamese_number(text):
 
 def parse_engagement_v83(innertext, debug_info):
     """
-    V8.5: Icon-specific parsing.
+    V8.6: Icon-specific parsing.
     
     Strategy:
     1. Tokenize innertext into icons and numbers (with positions)
@@ -581,9 +581,9 @@ def try_desktop_with_cookies(browser, url, cookies, result):
 
 
 def try_mobile_mode_v83(browser, url, cookies, result):
-    """V8.5 Mobile mode with icon-specific parsing"""
+    """V8.6 Mobile mode with API response capture + force play to load views"""
     try:
-        result['debug']['tried_modes'].append('mobile_v83')
+        result['debug']['tried_modes'].append('mobile_v86')
         
         mobile_url = url.replace('www.facebook.com', 'm.facebook.com')
         if 'm.facebook.com' not in mobile_url:
@@ -603,16 +603,58 @@ def try_mobile_mode_v83(browser, url, cookies, result):
         context.add_cookies(cookies)
         page = context.new_page()
         
-        response = page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
-        time.sleep(random.uniform(5, 6))
+        # V8.6: CAPTURE network responses to find view count from API calls
+        captured_api_responses = []
+        def handle_response(response):
+            try:
+                if response.status == 200:
+                    url_lower = response.url.lower()
+                    if any(k in url_lower for k in ['graphql', 'api/graphql', 'reel', 'video']):
+                        try:
+                            body = response.text()
+                            if body and 100 < len(body) < 5000000:
+                                if any(k in body for k in ['view_count', 'play_count', 'viewCount', 
+                                                             'playCount', 'reel_view', 'l\u01b0\u1ee3t xem']):
+                                    captured_api_responses.append(body)
+                        except:
+                            pass
+            except:
+                pass
+        page.on('response', handle_response)
         
-        for offset in [200, 400]:
+        response = page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
+        time.sleep(random.uniform(3, 4))
+        
+        # V8.6: Force video play to trigger view counter API
+        try:
+            page.evaluate("""
+                () => {
+                    const videos = document.querySelectorAll('video');
+                    videos.forEach(v => {
+                        try {
+                            v.muted = true;
+                            v.autoplay = true;
+                            const playPromise = v.play();
+                            if (playPromise) playPromise.catch(() => {});
+                        } catch(e) {}
+                    });
+                    const videoContainer = document.querySelector('[role="article"], [data-pagelet*="reel" i]');
+                    if (videoContainer) videoContainer.click();
+                }
+            """)
+            time.sleep(2)
+        except:
+            pass
+        
+        for offset in [200, 400, 600]:
             try:
                 page.evaluate(f'window.scrollTo(0, {offset})')
                 time.sleep(random.uniform(0.8, 1.2))
             except:
                 pass
-        time.sleep(2)
+        time.sleep(3)
+        
+        result['debug']['captured_api_count'] = len(captured_api_responses)
         
         mobile_innertext = ''
         try:
@@ -622,7 +664,45 @@ def try_mobile_mode_v83(browser, url, cookies, result):
         except:
             pass
         
-        # V8.5: Query DOM for view counter via JavaScript with USERNAME FILTER
+        # V8.6: Search captured API responses for target video views
+        target_post_id = result['data'].get('post_id', '')
+        api_views = 0
+        api_views_source = None
+        
+        for body in captured_api_responses:
+            if target_post_id and target_post_id in body:
+                view_patterns = [
+                    r'"video_view_count"\s*:\s*(\d+)',
+                    r'"play_count"\s*:\s*(\d+)',
+                    r'"reels_video_view_count"\s*:\s*(\d+)',
+                    r'"viewCount"\s*:\s*(\d+)',
+                    r'"playCount"\s*:\s*(\d+)',
+                ]
+                for pat in view_patterns:
+                    matches = re.findall(pat, body)
+                    for m in matches:
+                        try:
+                            val = int(m)
+                            if 10 <= val <= 1000000000:
+                                if val > api_views:
+                                    api_views = val
+                                    api_views_source = pat[:30]
+                        except:
+                            pass
+                if api_views > 0:
+                    break
+        
+        if api_views > 0:
+            result['data']['views'] = api_views
+            result['debug']['view_sources']['api_capture'] = api_views
+            result['debug']['api_views_pattern'] = api_views_source
+        
+        result['debug']['api_responses_summary'] = [
+            {'length': len(r), 'has_target_id': target_post_id in r if target_post_id else False}
+            for r in captured_api_responses[:5]
+        ]
+        
+        # V8.6: Query DOM for view counter via JavaScript with USERNAME FILTER
         # Aria-labels contain "Xem video thước phim của {username} có {views} lượt xem"
         # We need to MATCH username from caption/owner to filter target video
         try:
@@ -781,10 +861,10 @@ def try_mobile_mode_v83(browser, url, cookies, result):
         except Exception as e:
             logger.warning(f'DOM view query failed: {e}')
         
-        # V8.5: Use icon-specific parser
+        # V8.6: Use icon-specific parser
         parsed = parse_engagement_v83(mobile_innertext, result['debug'])
         
-        # Always set values from V8.5 (they may be 0 which is correct)
+        # Always set values from V8.6 (they may be 0 which is correct)
         result['data']['likes'] = parsed.get('likes', 0)
         result['data']['comments'] = parsed.get('comments', 0)
         result['data']['shares'] = parsed.get('shares', 0)
@@ -792,7 +872,7 @@ def try_mobile_mode_v83(browser, url, cookies, result):
             result['data']['views'] = parsed['views']
             result['debug']['view_sources']['mobile_v83_eye'] = parsed['views']
         
-        # V8.5: Removed fallback to mobile_html search_views_in_text
+        # V8.6: Removed fallback to mobile_html search_views_in_text
         # because it was picking up views from "Watch more reels" section (related reels)
         # not the target video. This caused incorrect views (e.g. 8.4M instead of 1.3K).
         # 
@@ -885,7 +965,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.5-target-only',
+        'version': '8.6-api-capture',
     })
 
 
@@ -909,7 +989,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.5-target-only',
+        'version': '8.6-api-capture',
     })
 
 
