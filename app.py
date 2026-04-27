@@ -1,19 +1,26 @@
 """
-Rise City Facebook Scraper API - V8.1 🎩
-TRIỆT ĐỂ KHÔNG TỐN PHÍ:
+Rise City Facebook Scraper API - V8.2 🎩 SMART ROUTING + VN PROXY
+BASE: V8.1.2 (đã verify working cho 95% engagement)
+PATCH MỚI V8.2:
+  - Smart Routing: chỉ dùng proxy khi views=0 (tiết kiệm bandwidth)
+  - VN Residential Proxy fallback (Webshare 1GB)
+  - Random rotate qua 10 IP VN: vn-1 → vn-10
+  - Fix views=0 cho video FB ẩn server-side cho datacenter IP
 
-5 ATTEMPTS PER REQUEST:
-1. Cookies + Desktop Chrome (current best for engagement)
-2. NO cookies + iPhone 15 Pro Safari + Google referer (NEW)
-3. NO cookies + Android Chrome + Vietnam location (NEW)
-4. Cookies + mbasic.facebook.com text-only (NEW lightweight)
-5. Cookies + mobile m.facebook.com (current backup)
+LOGIC:
+1. ATTEMPT 1: Scrape không proxy (5 modes như V8.1.2)
+   → Nếu views > 0 → DONE
+2. ATTEMPT 2: Nếu views = 0, retry với VN residential proxy
+   → Chỉ chạy desktop_cookies mode (tốn ít bandwidth)
+3. Combine: MAX của all view sources
 
-Strategy:
-- Mode 1: Engagement (likes, comments, shares, caption, thumbnail)
-- Mode 2-4: Anonymous views (try multiple fingerprints)
-- Mode 5: Mobile engagement backup
-- Combine: MAX of all view sources
+ENV VARS REQUIRED ON RENDER:
+- API_SECRET: rise-city-but-2026-secret-magic-key
+- FB_COOKIES_PATH: /etc/secrets/cookies.txt
+- PROXY_HOST: p.webshare.io
+- PROXY_PORT: 80
+- PROXY_USERNAME_BASE: ufxgmuzq (em sẽ append -vn-X)
+- PROXY_PASSWORD: 5h74how18ufw
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -31,6 +38,28 @@ app = Flask(__name__)
 
 COOKIES_PATH = os.getenv('FB_COOKIES_PATH', '/etc/secrets/cookies.txt')
 API_SECRET = os.getenv('API_SECRET', 'rise-city-secret-2026')
+
+# === V8.2: VN RESIDENTIAL PROXY CONFIG (Webshare) ===
+PROXY_HOST = os.getenv('PROXY_HOST', '')
+PROXY_PORT = os.getenv('PROXY_PORT', '80')
+PROXY_USERNAME_BASE = os.getenv('PROXY_USERNAME_BASE', '')  # ufxgmuzq
+PROXY_PASSWORD = os.getenv('PROXY_PASSWORD', '')
+PROXY_ENABLED = bool(PROXY_HOST and PROXY_USERNAME_BASE and PROXY_PASSWORD)
+
+
+def get_random_vn_proxy():
+    """Random rotate qua 10 IP VN: vn-1 → vn-10"""
+    if not PROXY_ENABLED:
+        return None
+    proxy_num = random.randint(1, 10)
+    username = f"{PROXY_USERNAME_BASE}-vn-{proxy_num}"
+    return {
+        'server': f'http://{PROXY_HOST}:{PROXY_PORT}',
+        'username': username,
+        'password': PROXY_PASSWORD,
+        'proxy_id': f'vn-{proxy_num}',  # for debug logging
+    }
+# === END V8.2 PROXY CONFIG ===
 
 USERNAME_BLACKLIST = {
     'recover', 'help', 'settings', 'privacy', 'home', 'login', 'logout',
@@ -148,22 +177,28 @@ def parse_vietnamese_number(text):
     return int(num)
 
 
+# ==========================================
+# PATCHED: parse_mobile_engagement
+# V8.1 original dùng regex thứ tự → SAI khi FB ẩn likes/shares
+# V8.1.2 dùng icon codepoint mapping + dual icon set
+# ==========================================
+
 def parse_mobile_engagement(innertext, debug_info):
     """
-    V8.1.2: Parse engagement by ICON CODEPOINT for BOTH Reels AND Video/Live.
+    PATCHED V8.1.2: Parse engagement bằng ICON CODEPOINT, hỗ trợ cả Reel và Video/Live.
     
-    FB uses TWO different icon sets:
-      REEL icons:       U+F0378=like  U+F0379=comment  U+F037A=share
-      VIDEO/LIVE icons: U+F0925=like  U+F0926=comment  U+F0927=share
+    FB dùng 2 bộ icon khác nhau:
+      REEL:       U+F0378=like  U+F0379=comment  U+F037A=share
+      VIDEO/LIVE: U+F0925=like  U+F0926=comment  U+F0927=share
     
-    Also parses "332 lượt xem" for video live view count.
+    Cũng parse "332 lượt xem" cho video live.
     """
     data = {'likes': 0, 'comments': 0, 'shares': 0, 'mobile_views': 0}
     
     if not innertext:
         return data
     
-    # Step 1: Isolate target before related content
+    # Step 1: Isolate target video (cắt trước related content)
     RELATED_MARKERS = [
         'Watch more reels like this',
         'Còn nhiều nội dung khác',
@@ -189,12 +224,10 @@ def parse_mobile_engagement(innertext, debug_info):
     debug_info['isolation_marker'] = matched_marker
     debug_info['isolation_length'] = len(target_text)
     
-    # Step 2: Detect format (Reel vs Video/Live)
-    # Reel icons
+    # Step 2: Detect icon set
     REEL_LIKE  = '\U000F0378'
     REEL_CMT   = '\U000F0379'
     REEL_SHARE = '\U000F037A'
-    # Video/Live icons
     VID_LIKE   = '\U000F0925'
     VID_CMT    = '\U000F0926'
     VID_SHARE  = '\U000F0927'
@@ -204,35 +237,34 @@ def parse_mobile_engagement(innertext, debug_info):
     
     debug_info['format_detected'] = 'video_live' if has_vid_icons else 'reel'
     
-    # Step 3: Parse based on format
+    # Step 3a: VIDEO/LIVE format (icon + space + number trên cùng 1 dòng)
     if has_vid_icons:
-        # VIDEO/LIVE format: "󰤥 5\n󰤦 1\n󰤧 2" (icon + space + number on same line)
         for line in lines:
-            line_stripped = line.strip()
-            if VID_LIKE in line_stripped:
-                m = re.search(r'[\d.,]+\s*[KkMmBb]?', line_stripped.split(VID_LIKE)[-1])
+            ls = line.strip()
+            if VID_LIKE in ls:
+                m = re.search(r'[\d.,]+\s*[KkMmBb]?', ls.split(VID_LIKE)[-1])
                 if m:
                     data['likes'] = parse_vietnamese_number(m.group(0))
                     debug_info['v83_like_raw'] = m.group(0)
-            elif VID_CMT in line_stripped:
-                m = re.search(r'[\d.,]+\s*[KkMmBb]?', line_stripped.split(VID_CMT)[-1])
+            elif VID_CMT in ls:
+                m = re.search(r'[\d.,]+\s*[KkMmBb]?', ls.split(VID_CMT)[-1])
                 if m:
                     data['comments'] = parse_vietnamese_number(m.group(0))
                     debug_info['v83_cmt_raw'] = m.group(0)
-            elif VID_SHARE in line_stripped:
-                m = re.search(r'[\d.,]+\s*[KkMmBb]?', line_stripped.split(VID_SHARE)[-1])
+            elif VID_SHARE in ls:
+                m = re.search(r'[\d.,]+\s*[KkMmBb]?', ls.split(VID_SHARE)[-1])
                 if m:
                     data['shares'] = parse_vietnamese_number(m.group(0))
                     debug_info['v83_share_raw'] = m.group(0)
         
-        # Parse "332 lượt xem" for views
+        # Parse "332 lượt xem"
         m = re.search(r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem', target_text)
         if m:
             data['mobile_views'] = parse_vietnamese_number(m.group(1))
             debug_info['mobile_views_raw'] = m.group(1)
     
+    # Step 3b: REEL format (icon trên 1 dòng, số trên dòng tiếp theo)
     if has_reel_icons:
-        # REEL format: icon on one line, number on next line
         def find_number_after(start_idx, max_look=2):
             for i in range(start_idx + 1, min(start_idx + 1 + max_look, len(lines))):
                 ln = lines[i].strip()
@@ -254,20 +286,23 @@ def parse_mobile_engagement(innertext, debug_info):
                 if cp == ord(REEL_LIKE) and not found_like:
                     found_like = True
                     val = find_number_after(i)
-                    data['likes'] = max(data['likes'], parse_vietnamese_number(val) if val else 0)
+                    reel_likes = parse_vietnamese_number(val) if val else 0
+                    data['likes'] = max(data['likes'], reel_likes)
                     debug_info['v83_like_raw'] = val
                 elif cp == ord(REEL_CMT) and not found_cmt:
                     found_cmt = True
                     val = find_number_after(i)
-                    data['comments'] = max(data['comments'], parse_vietnamese_number(val) if val else 0)
+                    reel_cmts = parse_vietnamese_number(val) if val else 0
+                    data['comments'] = max(data['comments'], reel_cmts)
                     debug_info['v83_cmt_raw'] = val
                 elif cp == ord(REEL_SHARE) and not found_share:
                     found_share = True
                     val = find_number_after(i)
-                    data['shares'] = max(data['shares'], parse_vietnamese_number(val) if val else 0)
+                    reel_shares = parse_vietnamese_number(val) if val else 0
+                    data['shares'] = max(data['shares'], reel_shares)
                     debug_info['v83_share_raw'] = val
     
-    debug_info['v83_engagement'] = {k: v for k, v in data.items() if k != 'mobile_views'}
+    debug_info['v83_engagement'] = {'likes': data['likes'], 'comments': data['comments'], 'shares': data['shares']}
     return data
 
 
@@ -463,16 +498,14 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
         try:
             page.evaluate("""
                 () => {
-                    // Find and remove login modals (but keep page visible)
                     const dialogs = document.querySelectorAll('[role="dialog"]');
                     dialogs.forEach(d => {
                         const text = d.textContent || '';
-                        if (text.includes('Đăng nhập') || text.includes('Log in')) {
+                        if (text.includes('\u0110\u0103ng nh\u1eadp') || text.includes('Log in')) {
                             d.style.display = 'none';
                         }
                     });
-                    // Remove overlays
-                    const overlays = document.querySelectorAll('[data-testid*="login"], [aria-label*="Đăng nhập"]');
+                    const overlays = document.querySelectorAll('[data-testid*="login"], [aria-label*="\u0110\u0103ng nh\u1eadp"]');
                     overlays.forEach(o => o.style.display = 'none');
                 }
             """)
@@ -504,7 +537,7 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
         debug_info[f'{name}_url_after_redirect'] = page.url
         
         # Check if redirected to login
-        if 'login' in page.url.lower() or 'Đăng nhập vào Facebook' in innertext[:200]:
+        if 'login' in page.url.lower() or '\u0110\u0103ng nh\u1eadp v\u00e0o Facebook' in innertext[:200]:
             debug_info[f'{name}_blocked'] = True
             context.close()
             return 0
@@ -578,6 +611,112 @@ def try_mbasic_for_views(browser, url, cookies, debug_info):
         return 0
 
 
+def try_vn_proxy_for_views(url, cookies, result):
+    """
+    V8.2 SMART ROUTING: Retry scrape với VN residential proxy 
+    để fix views=0 cho video FB ẩn server-side cho datacenter IP.
+    
+    - Random rotate qua 10 IP VN: vn-1 → vn-10
+    - Chỉ chạy desktop_cookies mode (đỡ tốn bandwidth)
+    - Tìm views từ HTML, network responses, mobile innertext
+    """
+    proxy_config = get_random_vn_proxy()
+    if not proxy_config:
+        logger.warning('VN Proxy: not configured')
+        return 0
+    
+    proxy_id = proxy_config.pop('proxy_id', 'unknown')
+    result['debug']['proxy_id_used'] = proxy_id
+    
+    try:
+        with sync_playwright() as p:
+            # Launch browser WITH PROXY
+            browser = p.chromium.launch(
+                headless=True,
+                proxy=proxy_config,  # KEY: dùng VN proxy
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-gpu',
+                    '--no-first-run',
+                    '--disable-infobars',
+                ]
+            )
+            
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1366, 'height': 768},
+                locale='vi-VN',
+                timezone_id='Asia/Ho_Chi_Minh',
+                extra_http_headers={
+                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                }
+            )
+            context.add_cookies(cookies)
+            
+            page = context.new_page()
+            
+            # Track network responses for view counts
+            network_views = []
+            
+            def handle_response(response):
+                try:
+                    if 'graphql' in response.url or 'video' in response.url:
+                        if response.status == 200:
+                            content_type = response.headers.get('content-type', '')
+                            if 'json' in content_type or 'javascript' in content_type:
+                                body = response.text()
+                                if body:
+                                    found = search_views_in_text(body)
+                                    if found > 0:
+                                        network_views.append(found)
+                except Exception:
+                    pass
+            
+            page.on('response', handle_response)
+            
+            try:
+                page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(3000)
+            except Exception as e:
+                logger.warning(f'VN Proxy: page.goto failed: {e}')
+            
+            html = page.content()
+            
+            try:
+                innertext = page.evaluate('document.body ? document.body.innerText : ""')
+            except Exception:
+                innertext = ''
+            
+            result['debug']['proxy_html_length'] = len(html)
+            result['debug']['proxy_innertext_length'] = len(innertext)
+            
+            # Search views in HTML + innertext + network
+            all_text = html + '\n' + innertext
+            html_views = search_views_in_text(all_text)
+            net_views = max(network_views) if network_views else 0
+            
+            result['debug']['proxy_html_views'] = html_views
+            result['debug']['proxy_network_views'] = net_views
+            
+            # ALSO try to update engagement if previous attempts had like=0
+            # (Skip this for now to keep proxy simple, focus only on views)
+            
+            final_proxy_views = max(html_views, net_views)
+            
+            context.close()
+            browser.close()
+            
+            return final_proxy_views
+    except Exception as e:
+        logger.exception(f'VN Proxy retry failed: {e}')
+        result['debug']['proxy_error'] = str(e)[:300]
+        return 0
+
+
 def scrape_with_playwright(url):
     cookies = parse_netscape_cookies(COOKIES_PATH)
     if not cookies:
@@ -644,6 +783,26 @@ def scrape_with_playwright(url):
             final_views = max(views_1, views_2, views_3, views_4)
             if final_views > 0:
                 result['data']['views'] = final_views
+            
+            # === V8.2 SMART ROUTING: Retry với VN Proxy nếu views=0 ===
+            result['debug']['proxy_used'] = False
+            result['debug']['proxy_views'] = 0
+            
+            if (result['data']['views'] == 0 and PROXY_ENABLED):
+                logger.info('🎩 Views=0, retry với VN residential proxy...')
+                proxy_views = try_vn_proxy_for_views(url, cookies, result)
+                result['debug']['proxy_used'] = True
+                result['debug']['proxy_views'] = proxy_views
+                
+                if proxy_views > 0:
+                    result['data']['views'] = proxy_views
+                    logger.info(f'✅ VN Proxy fix views=0! Got {proxy_views} views')
+            elif result['data']['views'] == 0 and not PROXY_ENABLED:
+                result['debug']['proxy_used'] = False
+                result['debug']['proxy_note'] = 'Views=0 but proxy not configured'
+            else:
+                result['debug']['proxy_skipped_reason'] = 'views_already_found'
+            # === END V8.2 SMART ROUTING ===
             
             if (result['data']['views'] > 0 or 
                 result['data']['likes'] > 0 or
@@ -729,8 +888,13 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         return 0
 
 
+# ==========================================
+# PATCHED: try_mobile_mode
+# V8.1.2: Always set engagement + use mobile_views from video/live
+# ==========================================
+
 def try_mobile_mode(browser, url, cookies, result):
-    """Mode 5: Mobile m.facebook.com for engagement"""
+    """Mode 5: Mobile m.facebook.com for engagement (PATCHED V8.1.2)"""
     try:
         result['debug']['tried_modes'].append('mobile_cookies')
         
@@ -771,14 +935,15 @@ def try_mobile_mode(browser, url, cookies, result):
         except:
             pass
         
+        # PATCHED: parse with icon-mapping + dual icon set
         engagement = parse_mobile_engagement(mobile_innertext, result['debug'])
         
-        # Always set engagement (even 0 is correct for hidden metrics)
-        result['data']['likes'] = engagement.get('likes', 0)
-        result['data']['comments'] = engagement.get('comments', 0)
-        result['data']['shares'] = engagement.get('shares', 0)
+        # Always set (even 0 is correct for hidden metrics)
+        result['data']['likes'] = engagement['likes']
+        result['data']['comments'] = engagement['comments']
+        result['data']['shares'] = engagement['shares']
         
-        # Mobile views: from "lượt xem" text (video/live) or search_views_in_text
+        # Mobile views: from "lượt xem" (video/live) or search_views_in_text
         mobile_views = engagement.get('mobile_views', 0)
         if mobile_views == 0 and mobile_innertext:
             mobile_views = search_views_in_text(mobile_innertext)
@@ -872,8 +1037,8 @@ def extract_metadata_from_html(html):
 def home():
     return jsonify({
         'status': 'ok',
-        'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.1.2-dual-icon',
+        'service': 'Rise City Facebook Scraper \U0001f3a9',
+        'version': '8.2.0-vn-proxy',
     })
 
 
@@ -897,7 +1062,11 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.1.2-dual-icon',
+        'version': '8.2.0-vn-proxy',
+        'proxy_enabled': PROXY_ENABLED,
+        'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
+        'proxy_country': 'VN' if PROXY_ENABLED else None,
+        'proxy_pool_size': 10 if PROXY_ENABLED else 0,
     })
 
 
