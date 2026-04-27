@@ -1,5 +1,5 @@
 """
-Rise City Facebook Scraper API - V8.3 🎩
+Rise City Facebook Scraper API - V8.4 🎩
 ROOT CAUSE FIX: Map icon→field by Unicode codepoint, NOT pattern matching.
 
 Discovery:
@@ -12,12 +12,12 @@ When engagement = 0, FB shows ICON without number!
 Pattern parsing fails because:
   󰍸\n󰍹\n6\n󰍺  ← like icon, comment icon, "6" (comments), share icon
   
-V7.8/V8.1 takes [6, 11, 1] as [likes, comments, shares] but actually:
+V7.8/V8.1/V8.3 takes [6, 11, 1] as [likes, comments, shares] but actually:
 - "6" = comments of reel 1
 - "11" = LIKES of reel 2 (different video!)
 - "1" = comments of reel 2
 
-V8.3 Strategy:
+V8.4 Strategy:
 1. Find FIRST occurrence of each icon
 2. Number AFTER icon = value for that field
 3. If NO number after icon → field = 0
@@ -177,7 +177,7 @@ def parse_vietnamese_number(text):
 
 def parse_engagement_v83(innertext, debug_info):
     """
-    V8.3: Icon-specific parsing.
+    V8.4: Icon-specific parsing.
     
     Strategy:
     1. Tokenize innertext into icons and numbers (with positions)
@@ -393,14 +393,15 @@ def simulate_human(page):
 
 
 def search_views_in_text(text):
-    """Search Vietnamese view patterns + JSON patterns"""
+    """Search Vietnamese view patterns + JSON patterns + aria-label"""
     candidates = []
     
+    # Vietnamese natural language patterns
     patterns = [
-        r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?)\s*l\\u01b0\\u1ee3t\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?)\s*l\u1ea7n\s*xem',
-        r'([\d.,]+\s*[KkMmBb]?)\s*views?\b',
+        r'([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*l\u01b0\u1ee3t\s*xem',
+        r'([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*l\\u01b0\\u1ee3t\s*xem',
+        r'([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*l\u1ea7n\s*xem',
+        r'([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*views?\b',
     ]
     
     for pat in patterns:
@@ -410,6 +411,7 @@ def search_views_in_text(text):
             if 10 <= value <= 1000000000:
                 candidates.append(value)
     
+    # JSON patterns (server-rendered data)
     json_patterns = [
         r'"video_view_count"\s*:\s*(\d+)',
         r'"play_count"\s*:\s*(\d+)',
@@ -418,6 +420,8 @@ def search_views_in_text(text):
         r'"organic_view_count"\s*:\s*(\d+)',
         r'"post_view_count"\s*:\s*(\d+)',
         r'"feedback_video_view_count"\s*:\s*(\d+)',
+        r'"reels_video_view_count"\s*:\s*(\d+)',
+        r'"reel_view_count"\s*:\s*(\d+)',
     ]
     
     for pat in json_patterns:
@@ -429,6 +433,20 @@ def search_views_in_text(text):
                     candidates.append(val)
             except:
                 pass
+    
+    # ARIA-LABEL patterns (UI accessibility)
+    # FB uses aria-label for view counter that's visually shown
+    aria_patterns = [
+        r'aria-label="([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*l\u01b0\u1ee3t\s*xem"',
+        r'aria-label="([\d.,]+\s*[KkMmBb]?(?:\s*ngh\u00ecn|\s*tri\u1ec7u)?)\s*views?"',
+    ]
+    
+    for pat in aria_patterns:
+        matches = re.findall(pat, text, re.IGNORECASE)
+        for m in matches[:20]:
+            value = parse_vietnamese_number(m)
+            if 10 <= value <= 1000000000:
+                candidates.append(value)
     
     return max(candidates) if candidates else 0
 
@@ -563,7 +581,7 @@ def try_desktop_with_cookies(browser, url, cookies, result):
 
 
 def try_mobile_mode_v83(browser, url, cookies, result):
-    """V8.3 Mobile mode with icon-specific parsing"""
+    """V8.4 Mobile mode with icon-specific parsing"""
     try:
         result['debug']['tried_modes'].append('mobile_v83')
         
@@ -604,10 +622,85 @@ def try_mobile_mode_v83(browser, url, cookies, result):
         except:
             pass
         
-        # V8.3: Use icon-specific parser
+        # V8.4: Query DOM for view counter via JavaScript
+        # FB renders view count in aria-label or dedicated elements
+        try:
+            view_count_dom = page.evaluate("""
+                () => {
+                    const results = [];
+                    
+                    // Strategy 1: aria-label containing "lượt xem"
+                    const elementsWithAria = document.querySelectorAll('[aria-label*="\u01b0\u1ee3t xem" i], [aria-label*="views" i], [aria-label*="view" i]');
+                    elementsWithAria.forEach(el => {
+                        const label = el.getAttribute('aria-label') || '';
+                        results.push({source: 'aria-label', text: label});
+                    });
+                    
+                    // Strategy 2: Elements with text containing K view (e.g. "1.3K", "1,3K")
+                    const allTextElements = document.querySelectorAll('span, div');
+                    let count = 0;
+                    for (const el of allTextElements) {
+                        if (count > 50) break;
+                        const text = (el.textContent || '').trim();
+                        // Look for "1.3K", "1,3K", "17K", "830K", "1,3 triệu" formats
+                        if (/^[\\d.,]+\\s*[KMB]\\s*$/i.test(text) || /^[\\d.,]+\\s*tri\u1ec7u$/i.test(text) || /^[\\d.,]+\\s*ngh\u00ecn$/i.test(text)) {
+                            // Check if parent has view-related context
+                            const parent = el.parentElement;
+                            const parentText = parent ? (parent.textContent || '') : '';
+                            const ariaLabel = (parent?.getAttribute('aria-label') || '') + ' ' + 
+                                              (el.getAttribute('aria-label') || '');
+                            if (parentText.includes('xem') || ariaLabel.toLowerCase().includes('view') || 
+                                ariaLabel.includes('xem')) {
+                                results.push({source: 'parent-context', text: text, parent: parentText.substring(0, 100)});
+                                count++;
+                            }
+                        }
+                    }
+                    
+                    // Strategy 3: Eye icon SVG (view count next to play icon)
+                    // Find the first reel container and look for "play count" patterns
+                    const playContainers = document.querySelectorAll('[role="article"], [data-pagelet*="reel" i]');
+                    for (const container of playContainers) {
+                        if (count > 100) break;
+                        // Find spans containing K or M or triệu numbers in this container
+                        const spans = container.querySelectorAll('span');
+                        for (const span of spans) {
+                            const text = (span.textContent || '').trim();
+                            if (/^[\\d.,]+\\s*[KM]\\s*$/i.test(text) || /^[\\d.,]+\\s*tri\u1ec7u$/i.test(text)) {
+                                results.push({source: 'reel-container', text: text});
+                                count++;
+                            }
+                        }
+                        break; // Only first container
+                    }
+                    
+                    return results;
+                }
+            """)
+            result['debug']['view_dom_candidates'] = view_count_dom[:20]
+            
+            # Parse DOM candidates to find view count
+            if view_count_dom:
+                for cand in view_count_dom:
+                    text = cand.get('text', '')
+                    parsed = parse_vietnamese_number(text)
+                    if 10 <= parsed <= 1000000000:
+                        if cand.get('source') == 'aria-label':
+                            # aria-label like "1,3 nghìn lượt xem" - high confidence
+                            result['data']['views'] = parsed
+                            result['debug']['view_sources']['mobile_aria_label'] = parsed
+                            break
+                        elif result['data']['views'] == 0:
+                            # Other sources - lower confidence
+                            result['data']['views'] = parsed
+                            result['debug']['view_sources']['mobile_dom'] = parsed
+        except Exception as e:
+            logger.warning(f'DOM view query failed: {e}')
+        
+        # V8.4: Use icon-specific parser
         parsed = parse_engagement_v83(mobile_innertext, result['debug'])
         
-        # Always set values from V8.3 (they may be 0 which is correct)
+        # Always set values from V8.4 (they may be 0 which is correct)
         result['data']['likes'] = parsed.get('likes', 0)
         result['data']['comments'] = parsed.get('comments', 0)
         result['data']['shares'] = parsed.get('shares', 0)
@@ -709,7 +802,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.3-icon-mapping',
+        'version': '8.4-dom-view-extraction',
     })
 
 
@@ -733,7 +826,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.3-icon-mapping',
+        'version': '8.4-dom-view-extraction',
     })
 
 
