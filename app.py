@@ -150,25 +150,20 @@ def parse_vietnamese_number(text):
 
 def parse_mobile_engagement(innertext, debug_info):
     """
-    V8.1 + V8.3 FIX: Parse engagement by ICON CODEPOINT, not position.
+    V8.1.2: Parse engagement by ICON CODEPOINT for BOTH Reels AND Video/Live.
     
-    FB PUA icons:
-      U+F0378 (󰍸) = LIKE
-      U+F0379 (󰍹) = COMMENT  
-      U+F037A (󰍺) = SHARE
+    FB uses TWO different icon sets:
+      REEL icons:       U+F0378=like  U+F0379=comment  U+F037A=share
+      VIDEO/LIVE icons: U+F0925=like  U+F0926=comment  U+F0927=share
     
-    Logic:
-    1. Isolate target reel (cut before related markers)
-    2. Find FIRST occurrence of each icon
-    3. Check if number follows within 2 lines
-    4. If next line is another icon (no number) → metric = 0 (FB hidden)
+    Also parses "332 lượt xem" for video live view count.
     """
-    data = {'likes': 0, 'comments': 0, 'shares': 0}
+    data = {'likes': 0, 'comments': 0, 'shares': 0, 'mobile_views': 0}
     
     if not innertext:
         return data
     
-    # Step 1: Isolate target reel before related reels
+    # Step 1: Isolate target before related content
     RELATED_MARKERS = [
         'Watch more reels like this',
         'Còn nhiều nội dung khác',
@@ -177,6 +172,8 @@ def parse_mobile_engagement(innertext, debug_info):
         'Tiếp tục dưới tên',
         'Đăng nhập để kết nối',
         'See more reels',
+        'Video khác bạn có thể thích',
+        'Xem thêm video bạn có',
     ]
     cut_pos = len(innertext)
     matched_marker = None
@@ -192,49 +189,85 @@ def parse_mobile_engagement(innertext, debug_info):
     debug_info['isolation_marker'] = matched_marker
     debug_info['isolation_length'] = len(target_text)
     
-    # Step 2: Icon codepoint mapping
-    ICON_LIKE  = '\U000F0378'
-    ICON_CMT   = '\U000F0379'
-    ICON_SHARE = '\U000F037A'
+    # Step 2: Detect format (Reel vs Video/Live)
+    # Reel icons
+    REEL_LIKE  = '\U000F0378'
+    REEL_CMT   = '\U000F0379'
+    REEL_SHARE = '\U000F037A'
+    # Video/Live icons
+    VID_LIKE   = '\U000F0925'
+    VID_CMT    = '\U000F0926'
+    VID_SHARE  = '\U000F0927'
     
-    def find_number_after(start_idx, max_look=2):
-        for i in range(start_idx + 1, min(start_idx + 1 + max_look, len(lines))):
-            ln = lines[i].strip()
-            if not ln:
-                continue
-            # Is it a number?
-            if re.match(r'^[\d.,]+\s*[KkMmBb]?$', ln) and len(ln) < 15:
-                return ln
-            # Is it another icon? → stop, this metric = 0
-            if any(ord(c) > 0xF0000 for c in ln):
-                return None
-            # Is it text? → stop
-            if len(ln) > 3 and not ln[0].isdigit():
-                return None
-        return None
+    has_reel_icons = REEL_LIKE in target_text or REEL_CMT in target_text
+    has_vid_icons = VID_LIKE in target_text or VID_CMT in target_text
     
-    found_like = found_cmt = found_share = False
+    debug_info['format_detected'] = 'video_live' if has_vid_icons else 'reel'
     
-    for i, line in enumerate(lines):
-        for c in line:
-            cp = ord(c)
-            if cp == ord(ICON_LIKE) and not found_like:
-                found_like = True
-                val = find_number_after(i)
-                data['likes'] = parse_vietnamese_number(val) if val else 0
-                debug_info['v83_like_raw'] = val
-            elif cp == ord(ICON_CMT) and not found_cmt:
-                found_cmt = True
-                val = find_number_after(i)
-                data['comments'] = parse_vietnamese_number(val) if val else 0
-                debug_info['v83_cmt_raw'] = val
-            elif cp == ord(ICON_SHARE) and not found_share:
-                found_share = True
-                val = find_number_after(i)
-                data['shares'] = parse_vietnamese_number(val) if val else 0
-                debug_info['v83_share_raw'] = val
+    # Step 3: Parse based on format
+    if has_vid_icons:
+        # VIDEO/LIVE format: "󰤥 5\n󰤦 1\n󰤧 2" (icon + space + number on same line)
+        for line in lines:
+            line_stripped = line.strip()
+            if VID_LIKE in line_stripped:
+                m = re.search(r'[\d.,]+\s*[KkMmBb]?', line_stripped.split(VID_LIKE)[-1])
+                if m:
+                    data['likes'] = parse_vietnamese_number(m.group(0))
+                    debug_info['v83_like_raw'] = m.group(0)
+            elif VID_CMT in line_stripped:
+                m = re.search(r'[\d.,]+\s*[KkMmBb]?', line_stripped.split(VID_CMT)[-1])
+                if m:
+                    data['comments'] = parse_vietnamese_number(m.group(0))
+                    debug_info['v83_cmt_raw'] = m.group(0)
+            elif VID_SHARE in line_stripped:
+                m = re.search(r'[\d.,]+\s*[KkMmBb]?', line_stripped.split(VID_SHARE)[-1])
+                if m:
+                    data['shares'] = parse_vietnamese_number(m.group(0))
+                    debug_info['v83_share_raw'] = m.group(0)
+        
+        # Parse "332 lượt xem" for views
+        m = re.search(r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem', target_text)
+        if m:
+            data['mobile_views'] = parse_vietnamese_number(m.group(1))
+            debug_info['mobile_views_raw'] = m.group(1)
     
-    debug_info['v83_engagement'] = data
+    if has_reel_icons:
+        # REEL format: icon on one line, number on next line
+        def find_number_after(start_idx, max_look=2):
+            for i in range(start_idx + 1, min(start_idx + 1 + max_look, len(lines))):
+                ln = lines[i].strip()
+                if not ln:
+                    continue
+                if re.match(r'^[\d.,]+\s*[KkMmBb]?$', ln) and len(ln) < 15:
+                    return ln
+                if any(ord(c) > 0xF0000 for c in ln):
+                    return None
+                if len(ln) > 3 and not ln[0].isdigit():
+                    return None
+            return None
+        
+        found_like = found_cmt = found_share = False
+        
+        for i, line in enumerate(lines):
+            for c in line:
+                cp = ord(c)
+                if cp == ord(REEL_LIKE) and not found_like:
+                    found_like = True
+                    val = find_number_after(i)
+                    data['likes'] = max(data['likes'], parse_vietnamese_number(val) if val else 0)
+                    debug_info['v83_like_raw'] = val
+                elif cp == ord(REEL_CMT) and not found_cmt:
+                    found_cmt = True
+                    val = find_number_after(i)
+                    data['comments'] = max(data['comments'], parse_vietnamese_number(val) if val else 0)
+                    debug_info['v83_cmt_raw'] = val
+                elif cp == ord(REEL_SHARE) and not found_share:
+                    found_share = True
+                    val = find_number_after(i)
+                    data['shares'] = max(data['shares'], parse_vietnamese_number(val) if val else 0)
+                    debug_info['v83_share_raw'] = val
+    
+    debug_info['v83_engagement'] = {k: v for k, v in data.items() if k != 'mobile_views'}
     return data
 
 
@@ -740,20 +773,19 @@ def try_mobile_mode(browser, url, cookies, result):
         
         engagement = parse_mobile_engagement(mobile_innertext, result['debug'])
         
-        if engagement.get('likes', 0) > 0:
-            result['data']['likes'] = engagement['likes']
-        if engagement.get('comments', 0) > 0:
-            result['data']['comments'] = engagement['comments']
-        if engagement.get('shares', 0) > 0:
-            result['data']['shares'] = engagement['shares']
+        # Always set engagement (even 0 is correct for hidden metrics)
+        result['data']['likes'] = engagement.get('likes', 0)
+        result['data']['comments'] = engagement.get('comments', 0)
+        result['data']['shares'] = engagement.get('shares', 0)
         
-        # Mobile innertext might also have views
-        if mobile_innertext:
+        # Mobile views: from "lượt xem" text (video/live) or search_views_in_text
+        mobile_views = engagement.get('mobile_views', 0)
+        if mobile_views == 0 and mobile_innertext:
             mobile_views = search_views_in_text(mobile_innertext)
-            if mobile_views > 0:
-                result['debug']['view_sources']['mobile_cookies'] = mobile_views
-                if mobile_views > result['data']['views']:
-                    result['data']['views'] = mobile_views
+        if mobile_views > 0:
+            result['debug']['view_sources']['mobile_cookies'] = mobile_views
+            if mobile_views > result['data']['views']:
+                result['data']['views'] = mobile_views
         
         context.close()
     except Exception as e:
@@ -841,7 +873,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.1.1-icon-fix',
+        'version': '8.1.2-dual-icon',
     })
 
 
@@ -865,7 +897,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.1.1-icon-fix',
+        'version': '8.1.2-dual-icon',
     })
 
 
