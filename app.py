@@ -1,26 +1,26 @@
 """
-Rise City Facebook Scraper API - V8.2 🎩 SMART ROUTING + VN PROXY
-BASE: V8.1.2 (đã verify working cho 95% engagement)
-PATCH MỚI V8.2:
-  - Smart Routing: chỉ dùng proxy khi views=0 (tiết kiệm bandwidth)
-  - VN Residential Proxy fallback (Webshare 1GB)
-  - Random rotate qua 10 IP VN: vn-1 → vn-10
-  - Fix views=0 cho video FB ẩn server-side cho datacenter IP
+Rise City Facebook Scraper API - V8.3 🎩 REEL GRID + SMART ROUTING + VN PROXY
+BASE: V8.2.1
+PATCH MỚI V8.3:
+  - REEL GRID SCRAPING: Khi single reel page không có views,
+    navigate sang profile reels grid (👁️ 185) để lấy views
+  - Extract profile URL từ HTML JSON patterns
+  - Match post_id trong reel grid để lấy đúng số views
+  - 3 strategy match: JSON pattern → DOM traversal → innertext fallback
 
 LOGIC:
-1. ATTEMPT 1: Scrape không proxy (5 modes như V8.1.2)
-   → Nếu views > 0 → DONE
-2. ATTEMPT 2: Nếu views = 0, retry với VN residential proxy
-   → Chỉ chạy desktop_cookies mode (tốn ít bandwidth)
-3. Combine: MAX của all view sources
+1. ATTEMPT 1: Scrape /reel/[id] (5 modes như V8.1.2) → engagement, caption
+2. NẾU views=0:
+   ATTEMPT 2 (V8.3 NEW): Reel Grid Scraping
+   → Extract profile URL từ HTML
+   → Navigate /[username]/reels/
+   → Match post_id → views
+3. NẾU views vẫn=0:
+   ATTEMPT 3 (V8.2): VN Residential Proxy fallback
 
 ENV VARS REQUIRED ON RENDER:
-- API_SECRET: rise-city-but-2026-secret-magic-key
-- FB_COOKIES_PATH: /etc/secrets/cookies.txt
-- PROXY_HOST: p.webshare.io
-- PROXY_PORT: 80
-- PROXY_USERNAME_BASE: ufxgmuzq (em sẽ append -vn-X)
-- PROXY_PASSWORD: 5h74how18ufw
+- API_SECRET, FB_COOKIES_PATH (như cũ)
+- PROXY_HOST, PROXY_PORT, PROXY_USERNAME_BASE, PROXY_PASSWORD (V8.2)
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -611,6 +611,240 @@ def try_mbasic_for_views(browser, url, cookies, debug_info):
         return 0
 
 
+def extract_profile_url_from_html(html):
+    """
+    V8.3: Extract profile URL của owner reel từ HTML JSON.
+    FB embed profile URL trong nhiều patterns khác nhau.
+    Returns: (profile_url, username) or (None, None)
+    """
+    # Pattern 1: owning_profile or owner with url
+    patterns = [
+        r'"owning_profile"\s*:\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"',
+        r'"creation_story"\s*:\s*\{[^}]*?"actors"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"',
+        r'"video_owner"\s*:\s*\{[^}]*?"profile_url"\s*:\s*"(https?:\\?/\\?/[^"]+?)"',
+        r'"actor"\s*:\s*\{[^}]*?"url"\s*:\s*"(https?:\\?/\\?/[^"]+facebook\.com\\?/[^"]+?)"',
+        r'"profile_picture_for_sticky_bar"\s*:\s*\{[^}]*?"profile_url"\s*:\s*"(https?:\\?/\\?/[^"]+?)"',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            url = match.group(1).replace('\\/', '/')
+            # Extract username from URL
+            user_match = re.search(r'facebook\.com/([^/?]+)', url)
+            if user_match:
+                username = user_match.group(1)
+                if username.lower() not in USERNAME_BLACKLIST:
+                    return url, username
+    
+    # Pattern: profile.php?id=
+    pid_match = re.search(r'facebook\.com\\?/profile\.php\?id=(\d+)', html)
+    if pid_match:
+        pid = pid_match.group(1)
+        return f'https://www.facebook.com/profile.php?id={pid}', f'profile.php?id={pid}'
+    
+    return None, None
+
+
+def parse_view_count_string(s):
+    """
+    Parse "1.2K", "185", "1,5K", "2,8 triệu" → integer.
+    Uses round() to avoid float precision issues (4.1 * 1000000 = 4099999.999).
+    """
+    if not s:
+        return 0
+    s = s.strip().replace(',', '.')
+    
+    # "X tri[ệe]u" (million)
+    m = re.match(r'^([\d.]+)\s*tri[ệe]u', s, re.IGNORECASE)
+    if m:
+        try:
+            return round(float(m.group(1)) * 1_000_000)
+        except:
+            return 0
+    
+    # "X K" or "X k"
+    m = re.match(r'^([\d.]+)\s*[KkN]', s)
+    if m:
+        try:
+            return round(float(m.group(1)) * 1_000)
+        except:
+            return 0
+    
+    # "X M" (rare)
+    m = re.match(r'^([\d.]+)\s*M', s)
+    if m:
+        try:
+            return round(float(m.group(1)) * 1_000_000)
+        except:
+            return 0
+    
+    # Plain digits
+    digits = re.sub(r'[^\d]', '', s)
+    if digits:
+        try:
+            return int(digits)
+        except:
+            return 0
+    
+    return 0
+
+
+def try_reel_grid_for_views(browser, profile_url, target_post_id, result):
+    """
+    V8.3 REEL GRID: Navigate sang profile reels grid để lấy view count.
+    FB hiển thị views ở grid (👁️ 185) nhưng KHÔNG ở single reel page.
+    
+    Args:
+        browser: Playwright browser instance (no proxy)
+        profile_url: URL profile của owner (e.g. https://www.facebook.com/the.mobifone)
+        target_post_id: post_id cần tìm view (từ step 1)
+        result: dict to update debug info
+    
+    Returns:
+        int: view count hoặc 0
+    """
+    if not profile_url or not target_post_id:
+        result['debug']['grid_skip_reason'] = 'no_profile_url_or_post_id'
+        return 0
+    
+    # Build reels grid URL
+    if 'profile.php?id=' in profile_url:
+        grid_url = profile_url + '&sk=reels'
+    else:
+        # Strip trailing slash, add /reels/
+        clean_url = profile_url.rstrip('/')
+        grid_url = clean_url + '/reels/'
+    
+    result['debug']['grid_url_attempted'] = grid_url
+    
+    try:
+        # Load cookies for grid scraping (engagement context)
+        cookies = parse_netscape_cookies(COOKIES_PATH)
+        
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1366, 'height': 1500},  # Tall to load more reels
+            locale='vi-VN',
+            timezone_id='Asia/Ho_Chi_Minh',
+            extra_http_headers={
+                'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+            }
+        )
+        if cookies:
+            context.add_cookies(cookies)
+        
+        page = context.new_page()
+        
+        try:
+            page.goto(grid_url, wait_until='domcontentloaded', timeout=30000)
+            page.wait_for_timeout(3500)  # Wait for reels grid to render
+        except Exception as e:
+            logger.warning(f'Grid: page.goto failed: {e}')
+            result['debug']['grid_goto_error'] = str(e)[:200]
+        
+        html = page.content()
+        result['debug']['grid_html_length'] = len(html)
+        
+        # Strategy 1: Search for reels grid data in JSON (preferred)
+        # FB embed reels list with: {"id":"<post_id>","play_count":<int>}
+        target_views = 0
+        
+        # Pattern A: video_view_count near post_id
+        for pat in [
+            r'"id"\s*:\s*"' + re.escape(target_post_id) + r'"[^}]*?"play_count"\s*:\s*(\d+)',
+            r'"id"\s*:\s*"' + re.escape(target_post_id) + r'"[^}]*?"video_view_count"\s*:\s*(\d+)',
+            r'"play_count"\s*:\s*(\d+)[^}]*?"id"\s*:\s*"' + re.escape(target_post_id) + r'"',
+            r'"video_view_count"\s*:\s*(\d+)[^}]*?"id"\s*:\s*"' + re.escape(target_post_id) + r'"',
+        ]:
+            m = re.search(pat, html)
+            if m:
+                target_views = int(m.group(1))
+                result['debug']['grid_match_method'] = 'json_pattern'
+                break
+        
+        # Strategy 2: Use DOM to find views via JS
+        if target_views == 0:
+            try:
+                dom_data = page.evaluate("""
+                    (targetPostId) => {
+                        const results = [];
+                        // Find all reel links containing the post_id
+                        const allLinks = document.querySelectorAll('a[href*="/reel/"]');
+                        for (const link of allLinks) {
+                            const href = link.getAttribute('href') || '';
+                            // Look at the parent container
+                            let container = link;
+                            for (let i = 0; i < 8; i++) {
+                                if (!container.parentElement) break;
+                                container = container.parentElement;
+                                const text = (container.innerText || '').trim();
+                                // Match patterns like "👁️ 185" or just "185" near eye icon
+                                // Also match Vietnamese number formats: "1,5K", "2,8 triệu"
+                                if (text && text.length < 200) {
+                                    const matches = text.match(/[\\d.,]+\\s*(?:triệu|tri[eệ]u|K|k|N|M)?/g);
+                                    if (matches) {
+                                        results.push({
+                                            href: href,
+                                            container_text: text.substring(0, 150),
+                                            view_strings: matches
+                                        });
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Also try to get all text contains the post_id
+                        return {
+                            reel_links: results.slice(0, 20),
+                            full_text_length: document.body ? document.body.innerText.length : 0,
+                        };
+                    }
+                """, target_post_id)
+                
+                result['debug']['grid_dom_links_count'] = len(dom_data.get('reel_links', []))
+                result['debug']['grid_full_text_length'] = dom_data.get('full_text_length', 0)
+                
+                # Find link matching target_post_id
+                for link_data in dom_data.get('reel_links', []):
+                    if target_post_id in link_data.get('href', ''):
+                        view_strings = link_data.get('view_strings', [])
+                        # Get the largest number found
+                        for vs in view_strings:
+                            v = parse_view_count_string(vs)
+                            if v > target_views:
+                                target_views = v
+                        if target_views > 0:
+                            result['debug']['grid_match_method'] = 'dom_match'
+                            result['debug']['grid_match_text'] = link_data.get('container_text', '')[:100]
+                            break
+            except Exception as e:
+                result['debug']['grid_dom_error'] = str(e)[:200]
+        
+        # Strategy 3: Page innertext fallback
+        if target_views == 0:
+            try:
+                innertext = page.evaluate('document.body ? document.body.innerText : ""')
+                result['debug']['grid_innertext_length'] = len(innertext)
+                
+                # Save sample for debug
+                if target_post_id[:6] in innertext:
+                    idx = innertext.find(target_post_id[:6])
+                    result['debug']['grid_innertext_around_postid'] = innertext[max(0, idx-100):idx+200]
+            except Exception:
+                pass
+        
+        result['debug']['grid_target_post_id'] = target_post_id
+        result['debug']['grid_views_found'] = target_views
+        
+        context.close()
+        return target_views
+    except Exception as e:
+        logger.exception(f'Reel grid retry failed: {e}')
+        result['debug']['grid_error'] = str(e)[:300]
+        return 0
+
+
 def try_vn_proxy_for_views(p, url, cookies, result):
     """
     V8.2 SMART ROUTING: Retry scrape với VN residential proxy 
@@ -788,6 +1022,38 @@ def scrape_with_playwright(url):
             if final_views > 0:
                 result['data']['views'] = final_views
             
+            # === V8.3 REEL GRID: Nếu views=0, scrape profile reels grid ===
+            # FB ẩn views ở single reel page nhưng HIỆN ở profile reels grid (👁️ 185)
+            result['debug']['grid_attempted'] = False
+            result['debug']['grid_views'] = 0
+            
+            if result['data']['views'] == 0:
+                # Read HTML từ desktop attempt để tìm profile URL
+                # (HTML đã được scrape trong try_desktop_with_cookies)
+                desktop_html = result['debug'].get('html_full_for_grid', '')
+                # Fallback: dùng html_length từ debug
+                
+                profile_url, owner_username = extract_profile_url_from_html(desktop_html)
+                result['debug']['grid_profile_url'] = profile_url
+                result['debug']['grid_owner_username'] = owner_username
+                
+                target_post_id = result['data'].get('post_id')
+                
+                if profile_url and target_post_id:
+                    logger.info(f'🎩 Views=0, thử Reel Grid: {profile_url}')
+                    grid_views = try_reel_grid_for_views(browser, profile_url, target_post_id, result)
+                    result['debug']['grid_attempted'] = True
+                    result['debug']['grid_views'] = grid_views
+                    
+                    if grid_views > 0:
+                        result['data']['views'] = grid_views
+                        logger.info(f'✅ Reel Grid fix views=0! Got {grid_views} views')
+                else:
+                    result['debug']['grid_skip_reason'] = 'no_profile_url_or_post_id'
+            else:
+                result['debug']['grid_skipped_reason'] = 'views_already_found'
+            # === END V8.3 REEL GRID ===
+            
             # === V8.2 SMART ROUTING: Retry với VN Proxy nếu views=0 ===
             # IMPORTANT: Phải gọi TRONG `with sync_playwright()` block,
             # pass `p` instance để tránh asyncio loop conflict.
@@ -820,6 +1086,10 @@ def scrape_with_playwright(url):
         logger.exception('Scrape failed')
         result['error'] = str(e)
         result['error_type'] = type(e).__name__
+    
+    # V8.3: Remove cached HTML before returning (save bandwidth)
+    if 'html_full_for_grid' in result.get('debug', {}):
+        del result['debug']['html_full_for_grid']
     
     return result
 
@@ -866,6 +1136,9 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         
         html = page.content()
         result['debug']['html_length'] = len(html)
+        
+        # V8.3: Cache HTML for reel grid profile extraction (max 500KB)
+        result['debug']['html_full_for_grid'] = html[:500000] if len(html) > 500000 else html
         
         views = search_views_in_text(html)
         
@@ -1046,7 +1319,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.2.1-vn-proxy-fixed',
+        'version': '8.3.0-reel-grid',
     })
 
 
@@ -1070,7 +1343,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.2.1-vn-proxy-fixed',
+        'version': '8.3.0-reel-grid',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
