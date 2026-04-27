@@ -149,26 +149,92 @@ def parse_vietnamese_number(text):
 
 
 def parse_mobile_engagement(innertext, debug_info):
+    """
+    V8.1 + V8.3 FIX: Parse engagement by ICON CODEPOINT, not position.
+    
+    FB PUA icons:
+      U+F0378 (󰍸) = LIKE
+      U+F0379 (󰍹) = COMMENT  
+      U+F037A (󰍺) = SHARE
+    
+    Logic:
+    1. Isolate target reel (cut before related markers)
+    2. Find FIRST occurrence of each icon
+    3. Check if number follows within 2 lines
+    4. If next line is another icon (no number) → metric = 0 (FB hidden)
+    """
     data = {'likes': 0, 'comments': 0, 'shares': 0}
     
     if not innertext:
         return data
     
-    icon_number_pattern = r'[\U000F0000-\U000FFFFD]\s*\n\s*([\d.,]+\s*[KkMmBb]?)\s*\n'
-    matches = re.findall(icon_number_pattern, innertext)
+    # Step 1: Isolate target reel before related reels
+    RELATED_MARKERS = [
+        'Watch more reels like this',
+        'Còn nhiều nội dung khác',
+        'Explore these popular topics',
+        'Hãy đăng nhập để khám phá',
+        'Tiếp tục dưới tên',
+        'Đăng nhập để kết nối',
+        'See more reels',
+    ]
+    cut_pos = len(innertext)
+    matched_marker = None
+    for marker in RELATED_MARKERS:
+        pos = innertext.find(marker)
+        if pos > 0 and pos < cut_pos:
+            cut_pos = pos
+            matched_marker = marker
     
-    debug_info['icon_pattern_matches'] = matches[:10]
+    target_text = innertext[:cut_pos]
+    lines = target_text.split('\n')
     
-    if len(matches) >= 3:
-        data['likes'] = parse_vietnamese_number(matches[0])
-        data['comments'] = parse_vietnamese_number(matches[1])
-        data['shares'] = parse_vietnamese_number(matches[2])
-    elif len(matches) == 2:
-        data['likes'] = parse_vietnamese_number(matches[0])
-        data['comments'] = parse_vietnamese_number(matches[1])
-    elif len(matches) == 1:
-        data['likes'] = parse_vietnamese_number(matches[0])
+    debug_info['isolation_marker'] = matched_marker
+    debug_info['isolation_length'] = len(target_text)
     
+    # Step 2: Icon codepoint mapping
+    ICON_LIKE  = '\U000F0378'
+    ICON_CMT   = '\U000F0379'
+    ICON_SHARE = '\U000F037A'
+    
+    def find_number_after(start_idx, max_look=2):
+        for i in range(start_idx + 1, min(start_idx + 1 + max_look, len(lines))):
+            ln = lines[i].strip()
+            if not ln:
+                continue
+            # Is it a number?
+            if re.match(r'^[\d.,]+\s*[KkMmBb]?$', ln) and len(ln) < 15:
+                return ln
+            # Is it another icon? → stop, this metric = 0
+            if any(ord(c) > 0xF0000 for c in ln):
+                return None
+            # Is it text? → stop
+            if len(ln) > 3 and not ln[0].isdigit():
+                return None
+        return None
+    
+    found_like = found_cmt = found_share = False
+    
+    for i, line in enumerate(lines):
+        for c in line:
+            cp = ord(c)
+            if cp == ord(ICON_LIKE) and not found_like:
+                found_like = True
+                val = find_number_after(i)
+                data['likes'] = parse_vietnamese_number(val) if val else 0
+                debug_info['v83_like_raw'] = val
+            elif cp == ord(ICON_CMT) and not found_cmt:
+                found_cmt = True
+                val = find_number_after(i)
+                data['comments'] = parse_vietnamese_number(val) if val else 0
+                debug_info['v83_cmt_raw'] = val
+            elif cp == ord(ICON_SHARE) and not found_share:
+                found_share = True
+                val = find_number_after(i)
+                data['shares'] = parse_vietnamese_number(val) if val else 0
+                debug_info['v83_share_raw'] = val
+    
+    debug_info['v83_engagement'] = data
     return data
 
 
@@ -775,7 +841,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper 🎩',
-        'version': '8.1-multi-fingerprint',
+        'version': '8.1.1-icon-fix',
     })
 
 
@@ -799,7 +865,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.1-multi-fingerprint',
+        'version': '8.1.1-icon-fix',
     })
 
 
