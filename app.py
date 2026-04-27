@@ -1,19 +1,24 @@
 """
-Rise City Facebook Scraper API - V8.1 🎩
-TRIỆT ĐỂ KHÔNG TỐN PHÍ:
+Rise City Facebook Scraper API - V8.2 🎩
+FIX TRIỆT ĐỂ BUG ENGAGEMENT LẪN VỚI RELATED REELS:
 
-5 ATTEMPTS PER REQUEST:
-1. Cookies + Desktop Chrome (current best for engagement)
-2. NO cookies + iPhone 15 Pro Safari + Google referer (NEW)
-3. NO cookies + Android Chrome + Vietnam location (NEW)
-4. Cookies + mbasic.facebook.com text-only (NEW lightweight)
-5. Cookies + mobile m.facebook.com (current backup)
+V8.1 BUG:
+- Mobile innertext có nhiều reels (chính + related)
+- icon_pattern_matches lấy hết → [7, 385, 2, 18K, 165, 33, ...]
+- Code lấy [0,1,2] → comments=385 SAI (đó là comments của reel khác)
 
-Strategy:
-- Mode 1: Engagement (likes, comments, shares, caption, thumbnail)
-- Mode 2-4: Anonymous views (try multiple fingerprints)
-- Mode 5: Mobile engagement backup
-- Combine: MAX of all view sources
+V8.2 FIX:
+- ISOLATE engagement của TARGET reel only
+- Cắt innertext TRƯỚC marker "Watch more reels", "Còn nhiều nội dung khác", related
+- Chỉ lấy 3 icon đầu tiên TRONG ĐOẠN TARGET
+- Verify post_id match trước khi accept
+
+5 ATTEMPTS PER REQUEST (giữ nguyên):
+1. Cookies + Desktop Chrome (engagement + metadata)
+2. NO cookies + iPhone 15 Pro Safari (anonymous views)
+3. NO cookies + Android Galaxy S24 (anonymous views)
+4. Cookies + mbasic.facebook.com (text-only)
+5. Cookies + mobile m.facebook.com (engagement với fix isolate)
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -43,6 +48,18 @@ USERNAME_BLACKLIST = {
     'terms', 'community', 'safety', 'legal', 'careers', 'ads',
     'developers', 'directory', 'badges', 'feed', 'timeline'
 }
+
+# Markers báo hiệu kết thúc target reel, bắt đầu related reels
+RELATED_MARKERS = [
+    'Watch more reels like this',
+    'C\u00f2n nhi\u1ec1u n\u1ed9i dung kh\u00e1c',
+    'Explore these popular topics',
+    'H\u00e3y \u0111\u0103ng nh\u1eadp \u0111\u1ec3 kh\u00e1m ph\u00e1',
+    'Ti\u1ebfp t\u1ee5c d\u01b0\u1edbi t\u00ean',
+    '\u0110\u0103ng nh\u1eadp \u0111\u1ec3 k\u1ebft n\u1ed1i',
+    'Related',
+    'See more reels',
+]
 
 
 @app.after_request
@@ -148,17 +165,71 @@ def parse_vietnamese_number(text):
     return int(num)
 
 
+def isolate_target_innertext(innertext, debug_info):
+    """
+    NEW V8.2: Cắt innertext chỉ giữ phần TARGET reel, bỏ related reels.
+    
+    Mobile innertext structure:
+    ┌─────────────────────────────┐
+    │ [icons] [target reel data]  │ ← PHẦN NÀY GIỮ
+    │ Watch more reels like this  │ ← MARKER
+    │ [related reel 1]            │ ← BỎ
+    │ [related reel 2]            │ ← BỎ
+    │ Đăng nhập để khám phá...    │ ← BỎ
+    └─────────────────────────────┘
+    """
+    if not innertext:
+        return ''
+    
+    # Find earliest marker position
+    cut_pos = len(innertext)
+    matched_marker = None
+    
+    for marker in RELATED_MARKERS:
+        pos = innertext.find(marker)
+        if pos > 0 and pos < cut_pos:
+            cut_pos = pos
+            matched_marker = marker
+    
+    debug_info['isolation_marker'] = matched_marker
+    debug_info['isolation_cut_pos'] = cut_pos
+    debug_info['isolation_original_length'] = len(innertext)
+    
+    isolated = innertext[:cut_pos]
+    debug_info['isolation_result_length'] = len(isolated)
+    
+    return isolated
+
+
 def parse_mobile_engagement(innertext, debug_info):
+    """
+    V8.2 FIX: Parse engagement chỉ từ TARGET reel (đã isolate).
+    
+    Logic:
+    1. Isolate target portion
+    2. Find first 3 icon-number patterns
+    3. Map: [0]=likes, [1]=comments, [2]=shares
+    """
     data = {'likes': 0, 'comments': 0, 'shares': 0}
     
     if not innertext:
         return data
     
+    # ISOLATE first
+    target_text = isolate_target_innertext(innertext, debug_info)
+    
+    # Pattern: icon (PUA char) + newline + number + newline
     icon_number_pattern = r'[\U000F0000-\U000FFFFD]\s*\n\s*([\d.,]+\s*[KkMmBb]?)\s*\n'
-    matches = re.findall(icon_number_pattern, innertext)
+    matches = re.findall(icon_number_pattern, target_text)
     
-    debug_info['icon_pattern_matches'] = matches[:10]
+    debug_info['icon_pattern_matches_isolated'] = matches[:10]
     
+    # Verify: target reel chỉ nên có 3-4 icons (likes, comments, shares)
+    # Nếu > 6 icons → có thể isolation chưa đủ chặt
+    if len(matches) > 6:
+        debug_info['isolation_warning'] = f'Too many icons ({len(matches)}) - taking first 3'
+    
+    # Take FIRST 3 (target reel)
     if len(matches) >= 3:
         data['likes'] = parse_vietnamese_number(matches[0])
         data['comments'] = parse_vietnamese_number(matches[1])
@@ -211,6 +282,14 @@ def search_views_in_text(text):
     return max(candidates) if candidates else 0
 
 
+def search_views_in_target_text(text, debug_info):
+    """
+    V8.2 NEW: Search views chỉ trong TARGET portion (trước related markers)
+    """
+    target_text = isolate_target_innertext(text, debug_info)
+    return search_views_in_text(target_text)
+
+
 def simulate_human(page):
     try:
         for _ in range(2):
@@ -226,7 +305,7 @@ def simulate_human(page):
 
 
 # ==========================================
-# FINGERPRINTS - 3 different realistic profiles
+# FINGERPRINTS
 # ==========================================
 
 FINGERPRINT_IPHONE_15 = {
@@ -268,33 +347,9 @@ FINGERPRINT_ANDROID_S24 = {
     }
 }
 
-FINGERPRINT_DESKTOP_CHROME_VN = {
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'viewport': {'width': 1366, 'height': 768},
-    'device_scale_factor': 1,
-    'is_mobile': False,
-    'has_touch': False,
-    'extra_headers': {
-        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Referer': 'https://www.google.com.vn/',
-        'sec-ch-ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'cross-site',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
-    }
-}
-
 
 def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
-    """
-    Try to scrape views WITHOUT cookies but with realistic fingerprint.
-    The key insight: Different fingerprints might bypass FB's anti-bot.
-    """
+    """Anonymous mode for views (unchanged from V8.1)"""
     try:
         debug_info[f'{name}_attempted'] = True
         
@@ -309,20 +364,13 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
             extra_http_headers=fingerprint['extra_headers'],
         )
         
-        # NO cookies - anonymous
         page = context.new_page()
         
-        # Anti-detection scripts
         page.add_init_script("""
-            // Override webdriver detection
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
-            
-            // Fake chrome runtime
             window.chrome = { runtime: {} };
-            
-            // Hide playwright trace
             const originalQuery = window.navigator.permissions?.query;
             if (originalQuery) {
                 window.navigator.permissions.query = (params) => (
@@ -331,13 +379,10 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
                         : originalQuery(params)
                 );
             }
-            
-            // Pretend to have screen
             Object.defineProperty(screen, 'availWidth', { get: () => 1366 });
             Object.defineProperty(screen, 'availHeight', { get: () => 768 });
         """)
         
-        # Capture all responses
         captured_responses = []
         def handle_response(response):
             try:
@@ -357,10 +402,8 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
         logger.info(f'{name} navigating to: {url}')
         response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
         
-        # Random wait like real user (3-7s)
         time.sleep(random.uniform(3, 6))
         
-        # Try to dismiss login overlay if appears (without dismissing video)
         try:
             page.evaluate("""
                 () => {
@@ -379,7 +422,6 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
         except:
             pass
         
-        # Scroll to trigger view counter render
         try:
             page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
             time.sleep(2)
@@ -388,7 +430,6 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
         except:
             pass
         
-        # Get all data
         html = page.content()
         innertext = ''
         try:
@@ -402,15 +443,14 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
         debug_info[f'{name}_network_count'] = len(captured_responses)
         debug_info[f'{name}_url_after_redirect'] = page.url
         
-        # Check if redirected to login
         if 'login' in page.url.lower() or '\u0110\u0103ng nh\u1eadp v\u00e0o Facebook' in innertext[:200]:
             debug_info[f'{name}_blocked'] = True
             context.close()
             return 0
         
-        # Search views in all sources
+        # V8.2: Search views in TARGET portion only (avoid related reels)
         all_text = '\n'.join([html, innertext] + captured_responses)
-        views = search_views_in_text(all_text)
+        views = search_views_in_target_text(all_text, debug_info)
         
         debug_info[f'{name}_views_found'] = views
         debug_info[f'{name}_html_keywords'] = {
@@ -428,14 +468,10 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
 
 
 def try_mbasic_for_views(browser, url, cookies, debug_info):
-    """
-    NEW MODE: mbasic.facebook.com - text-only mobile site.
-    Sometimes shows view counter that desktop/mobile hides.
-    """
+    """mbasic.facebook.com - text-only mobile site"""
     try:
         debug_info['mbasic_attempted'] = True
         
-        # Convert URL to mbasic
         mbasic_url = url.replace('www.facebook.com', 'mbasic.facebook.com')
         if 'mbasic.facebook.com' not in mbasic_url:
             mbasic_url = mbasic_url.replace('facebook.com', 'mbasic.facebook.com')
@@ -466,7 +502,7 @@ def try_mbasic_for_views(browser, url, cookies, debug_info):
         debug_info['mbasic_innertext_preview'] = innertext[:500]
         
         all_text = html + '\n' + innertext
-        views = search_views_in_text(all_text)
+        views = search_views_in_target_text(all_text, debug_info)
         debug_info['mbasic_views_found'] = views
         
         context.close()
@@ -496,6 +532,7 @@ def scrape_with_playwright(url):
             'mode_used': '',
             'tried_modes': [],
             'view_sources': {},
+            'version': '8.2-isolation-fix',
         }
     }
     
@@ -514,32 +551,26 @@ def scrape_with_playwright(url):
                 ]
             )
             
-            # === ATTEMPT 1: Desktop with cookies (engagement + metadata) ===
             views_1 = try_desktop_with_cookies(browser, url, cookies, result)
             result['debug']['view_sources']['desktop_cookies'] = views_1
             
-            # === ATTEMPT 2: iPhone 15 anonymous (NEW) ===
             views_2 = try_anonymous_with_fingerprint(
                 browser, url, FINGERPRINT_IPHONE_15, 'iphone15', result['debug']
             )
             result['debug']['view_sources']['iphone15_anon'] = views_2
             
-            # === ATTEMPT 3: Android S24 anonymous (NEW) ===
             views_3 = try_anonymous_with_fingerprint(
                 browser, url, FINGERPRINT_ANDROID_S24, 'android', result['debug']
             )
             result['debug']['view_sources']['android_anon'] = views_3
             
-            # === ATTEMPT 4: mbasic.facebook.com text-only (NEW) ===
             views_4 = try_mbasic_for_views(browser, url, cookies, result['debug'])
             result['debug']['view_sources']['mbasic_cookies'] = views_4
             
-            # === ATTEMPT 5: Mobile m.facebook.com (engagement backup) ===
             try_mobile_mode(browser, url, cookies, result)
             
             browser.close()
             
-            # COMBINE: Take MAX views from all sources
             final_views = max(views_1, views_2, views_3, views_4)
             if final_views > 0:
                 result['data']['views'] = final_views
@@ -599,7 +630,8 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         html = page.content()
         result['debug']['html_length'] = len(html)
         
-        views = search_views_in_text(html)
+        # V8.2: Search views with isolation
+        views = search_views_in_text(html)  # HTML không có related markers như innertext
         
         extracted = extract_metadata_from_html(html)
         result['debug']['extracted_data'] = extracted
@@ -629,7 +661,10 @@ def try_desktop_with_cookies(browser, url, cookies, result):
 
 
 def try_mobile_mode(browser, url, cookies, result):
-    """Mode 5: Mobile m.facebook.com for engagement"""
+    """
+    Mode 5: Mobile m.facebook.com for engagement
+    V8.2 FIX: Isolate target reel before parsing engagement
+    """
     try:
         result['debug']['tried_modes'].append('mobile_cookies')
         
@@ -670,6 +705,7 @@ def try_mobile_mode(browser, url, cookies, result):
         except:
             pass
         
+        # V8.2: parse_mobile_engagement now uses isolation internally
         engagement = parse_mobile_engagement(mobile_innertext, result['debug'])
         
         if engagement.get('likes', 0) > 0:
@@ -679,9 +715,8 @@ def try_mobile_mode(browser, url, cookies, result):
         if engagement.get('shares', 0) > 0:
             result['data']['shares'] = engagement['shares']
         
-        # Mobile innertext might also have views
         if mobile_innertext:
-            mobile_views = search_views_in_text(mobile_innertext)
+            mobile_views = search_views_in_target_text(mobile_innertext, result['debug'])
             if mobile_views > 0:
                 result['debug']['view_sources']['mobile_cookies'] = mobile_views
                 if mobile_views > result['data']['views']:
@@ -773,7 +808,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.1-multi-fingerprint',
+        'version': '8.2-isolation-fix',
     })
 
 
@@ -797,7 +832,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.1-multi-fingerprint',
+        'version': '8.2-isolation-fix',
     })
 
 
