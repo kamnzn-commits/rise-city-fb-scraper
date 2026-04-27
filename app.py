@@ -239,8 +239,11 @@ def extract_comments_from_html(html, target_post_id):
 
 def extract_engagement_from_network(captured_bodies, target_post_id, debug_info):
     """
-    V8.5 CORE: Search captured GraphQL network responses for engagement data.
-    FB sends engagement via streaming JSON responses.
+    V8.5b CORE: Search captured network responses for engagement data.
+    FB encodes JSON in multiple ways:
+    - Normal: "reaction_count":{"count":43}
+    - Escaped: \"reaction_count\":{\"count\":43}  (inside JSON strings)
+    - Double: \\\"reaction_count\\\":{\\\"count\\\":43} (inside escaped JSON)
     """
     result = {'likes': 0, 'shares': 0, 'views': 0, 'comments_net': 0}
     
@@ -252,82 +255,95 @@ def extract_engagement_from_network(captured_bodies, target_post_id, debug_info)
     views_candidates = []
     comments_candidates = []
     
-    for body in captured_bodies:
-        # Skip small or non-JSON bodies
+    # Keywords to check which bodies have engagement data
+    keyword_hits = []
+    
+    for idx, body in enumerate(captured_bodies):
         if len(body) < 50:
             continue
         
-        # Check if this body contains target post_id
-        has_target = target_post_id and target_post_id in body
+        # Check if body contains target post_id (normal or escaped)
+        has_target = target_post_id and (
+            target_post_id in body or
+            f'\\"{target_post_id}\\"' in body or
+            f'\\\\\\"{target_post_id}\\\\\\"' in body
+        )
         
-        # LIKES patterns
-        for pat in [
+        # Quick keyword scan for debugging
+        kw_found = []
+        for kw in ['reaction_count', 'share_count', 'video_view_count', 'play_count', 'i18n_reaction_count']:
+            if kw in body:
+                kw_found.append(kw)
+        if kw_found:
+            keyword_hits.append({'body_idx': idx, 'size': len(body), 'keywords': kw_found, 'has_target': has_target})
+        
+        # === LIKES patterns (normal + escaped) ===
+        likes_pats = [
             r'"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-            r'"reactors"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+            r'\\"reaction_count\\":\{\\"count\\":(\d+)',
+            r'\\\\"reaction_count\\\\":\\\\\{\\\\"count\\\\":(\d+)',
             r'"i18n_reaction_count"\s*:\s*"(\d+)',
-            r'"reaction_count"\s*:\s*(\d+)',
-        ]:
+            r'\\"i18n_reaction_count\\":\s*\\"(\d+)',
+            r'"reactors"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+            r'\\"reactors\\":\{\\"count\\":(\d+)',
+        ]
+        for pat in likes_pats:
             for m in re.finditer(pat, body):
                 val = int(m.group(1))
-                if has_target:
-                    # Proximity check within this body
-                    pid_pos = body.find(target_post_id)
-                    dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
-                    likes_candidates.append({'value': val, 'distance': dist, 'in_target_body': True})
-                else:
-                    likes_candidates.append({'value': val, 'distance': 99999, 'in_target_body': False})
+                pid_pos = body.find(target_post_id) if target_post_id else -1
+                dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
+                likes_candidates.append({'value': val, 'distance': dist, 'in_target_body': has_target, 'body_idx': idx})
         
-        # SHARES patterns
-        for pat in [
+        # === SHARES patterns ===
+        shares_pats = [
             r'"share_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+            r'\\"share_count\\":\{\\"count\\":(\d+)',
             r'"reshare_count"\s*:\s*(\d+)',
-        ]:
+            r'\\"reshare_count\\":(\d+)',
+        ]
+        for pat in shares_pats:
             for m in re.finditer(pat, body):
                 val = int(m.group(1))
-                if has_target:
-                    pid_pos = body.find(target_post_id)
-                    dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
-                    shares_candidates.append({'value': val, 'distance': dist, 'in_target_body': True})
-                else:
-                    shares_candidates.append({'value': val, 'distance': 99999, 'in_target_body': False})
+                pid_pos = body.find(target_post_id) if target_post_id else -1
+                dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
+                shares_candidates.append({'value': val, 'distance': dist, 'in_target_body': has_target, 'body_idx': idx})
         
-        # VIEWS patterns
-        for pat in [
+        # === VIEWS patterns ===
+        views_pats = [
             r'"video_view_count"\s*:\s*(\d+)',
+            r'\\"video_view_count\\":(\d+)',
             r'"play_count"\s*:\s*(\d+)',
+            r'\\"play_count\\":(\d+)',
             r'"viewCount"\s*:\s*(\d+)',
-            r'"reels_view_count"\s*:\s*(\d+)',
-        ]:
+            r'\\"viewCount\\":(\d+)',
+        ]
+        for pat in views_pats:
             for m in re.finditer(pat, body):
                 val = int(m.group(1))
                 if 10 <= val <= 1000000000:
-                    if has_target:
-                        pid_pos = body.find(target_post_id)
-                        dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
-                        views_candidates.append({'value': val, 'distance': dist, 'in_target_body': True})
-                    else:
-                        views_candidates.append({'value': val, 'distance': 99999, 'in_target_body': False})
+                    pid_pos = body.find(target_post_id) if target_post_id else -1
+                    dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
+                    views_candidates.append({'value': val, 'distance': dist, 'in_target_body': has_target, 'body_idx': idx})
         
-        # COMMENTS from network too
-        for pat in [r'"total_comment_count"\s*:\s*(\d+)']:
+        # === COMMENTS from network ===
+        for pat in [r'"total_comment_count"\s*:\s*(\d+)', r'\\"total_comment_count\\":(\d+)']:
             for m in re.finditer(pat, body):
                 val = int(m.group(1))
-                if has_target:
-                    pid_pos = body.find(target_post_id)
-                    dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
-                    comments_candidates.append({'value': val, 'distance': dist, 'in_target_body': True})
+                pid_pos = body.find(target_post_id) if target_post_id else -1
+                dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
+                comments_candidates.append({'value': val, 'distance': dist, 'in_target_body': has_target})
     
-    # Pick best candidates: prefer in_target_body=True, then closest distance
-    def pick_best(candidates):
+    # Pick best candidates: prefer in_target_body=True + closest distance
+    def pick_best(candidates, max_dist=5000):
         if not candidates:
             return 0
-        # First try candidates in target body
-        target_cands = [c for c in candidates if c['in_target_body']]
+        target_cands = [c for c in candidates if c['in_target_body'] and c['distance'] < max_dist]
         if target_cands:
-            # Pick closest to post_id
-            best = min(target_cands, key=lambda c: c['distance'])
-            if best['distance'] < 5000:
-                return best['value']
+            return min(target_cands, key=lambda c: c['distance'])['value']
+        # Fallback: any candidate close enough
+        close_cands = [c for c in candidates if c['distance'] < max_dist]
+        if close_cands:
+            return min(close_cands, key=lambda c: c['distance'])['value']
         return 0
     
     result['likes'] = pick_best(likes_candidates)
@@ -339,8 +355,7 @@ def extract_engagement_from_network(captured_bodies, target_post_id, debug_info)
     debug_info['v85_shares_candidates'] = len(shares_candidates)
     debug_info['v85_views_candidates'] = len(views_candidates)
     debug_info['v85_comments_candidates'] = len(comments_candidates)
-    
-    # Log first few for debugging
+    debug_info['v85_keyword_hits'] = keyword_hits[:10]
     debug_info['v85_likes_samples'] = [{'val': c['value'], 'dist': c['distance'], 'target': c['in_target_body']} for c in likes_candidates[:5]]
     debug_info['v85_views_samples'] = [{'val': c['value'], 'dist': c['distance'], 'target': c['in_target_body']} for c in views_candidates[:5]]
     
@@ -368,7 +383,7 @@ def scrape_with_playwright(url):
         'debug': {
             'final_url': '', 'page_title': '',
             'cookies_count': len(cookies),
-            'version': '8.5-network-capture',
+            'version': '8.5b-wide-capture',
             'target_post_id_from_url': target_post_id,
         }
     }
@@ -406,22 +421,22 @@ def scrape_with_playwright(url):
                 Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
             """)
             
-            # CAPTURE ALL NETWORK RESPONSES
+            # CAPTURE ALL NETWORK RESPONSES (V8.5b: widen filter)
             def handle_response(resp):
                 try:
-                    if resp.status == 200:
-                        url_lower = resp.url.lower()
-                        # Capture GraphQL, API, and any JSON responses
-                        if any(k in url_lower for k in [
-                            'graphql', '/api/', 'ajax', 'relay', 
-                            'stream', 'comet', 'reels'
-                        ]):
-                            try:
-                                body = resp.text()
-                                if body and len(body) < 5000000:
-                                    captured_bodies.append(body)
-                            except:
-                                pass
+                    ct = resp.headers.get('content-type', '')
+                    url_lower = resp.url.lower()
+                    # Capture EVERYTHING from facebook.com that looks like data
+                    is_fb = 'facebook.com' in url_lower or 'fbcdn.net' in url_lower
+                    is_data = ('json' in ct or 'javascript' in ct or 'text' in ct or
+                               any(k in url_lower for k in ['graphql', 'api', 'ajax', 'relay', 'stream', 'comet']))
+                    if is_fb and is_data and resp.status == 200:
+                        try:
+                            body = resp.text()
+                            if body and 50 < len(body) < 10000000:
+                                captured_bodies.append(body)
+                        except:
+                            pass
                 except:
                     pass
             
@@ -517,7 +532,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.5-network-capture',
+        'version': '8.5b-wide-capture',
     })
 
 
@@ -539,7 +554,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.5-network-capture',
+        'version': '8.5b-wide-capture',
     })
 
 
