@@ -1,36 +1,19 @@
 """
-Rise City Facebook Scraper API - V8.4 🎩
-ĐÀO SÂU GỐC RỄ - PARSE JSON TỪ HTML SOURCE CODE
+Rise City Facebook Scraper API - V8.5 🎩
+CAPTURE NETWORK GRAPHQL RESPONSES
 
-TRIỆT ĐỂ BỎ:
-❌ innertext parsing
-❌ icon codepoint mapping  
-❌ DOM walker
-❌ mobile m.facebook.com engagement
-❌ Mọi thứ phụ thuộc giao diện
+ROOT CAUSE (confirmed by debug-html):
+- HTML static KHÔNG có reaction_count, share_count, video_view_count
+- FB load engagement data via ASYNC GraphQL streaming (RelayPrefetchedStreamCache)
+- HTML chỉ có: total_comment_count, metadata (caption, thumbnail, post_id)
+- Likes, shares, views được gửi qua NETWORK RESPONSES sau page render
 
-THAY BẰNG:
-✅ Parse JSON embedded trong <script> tags (server-side data)
-✅ Match target video bằng post_id/video_id
-✅ Extract engagement từ JSON object chính xác
-✅ Proximity matching: chỉ lấy data WITHIN 5000 chars của target post_id
-
-FB embed data trong HTML dạng:
-- <script type="application/json" data-sjs>...</script>
-- require("RelayPrefetchedStreamCache").next(...)
-- __comet_data__ / handleWithCustomApplyEach
-
-Trong các JSON blocks, engagement nằm trong:
-- "reaction_count":{"count":N}
-- "comment_rendering_instance":{"comments":{"total_count":N}}
-- "share_count":{"count":N}  
-- "video_view_count":N / "play_count":N
-
-Strategy:
-1. Desktop Chrome + cookies → lấy 1.4MB HTML
-2. Parse TẤT CẢ JSON từ HTML source
-3. Tìm post_id → extract engagement trong proximity
-4. Fallback: nếu JSON parse fail → regex patterns trên raw HTML
+V8.5 STRATEGY:
+1. page.on('response') → capture ALL GraphQL network responses
+2. HTML parse → metadata (caption, thumbnail, post_id)
+3. total_comment_count từ HTML (có sẵn)
+4. Network responses → search reaction_count, share_count, video_view_count
+5. Proximity match: chỉ accept data WITHIN 5000 chars of target post_id
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -120,13 +103,12 @@ def parse_netscape_cookies(cookies_path):
     return cookies
 
 
-def parse_number(text):
-    """Parse number from various formats: 43, 1.5K, 1,500, etc."""
-    if text is None:
+def parse_number(val):
+    if val is None:
         return 0
-    if isinstance(text, (int, float)):
-        return int(text)
-    s = str(text).strip()
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip()
     if not s:
         return 0
     match = re.match(r'([\d.,]+)\s*([KkMmBbTrtr]+)?', s)
@@ -159,154 +141,54 @@ def parse_number(text):
     return int(num)
 
 
-# ==========================================
-# CORE V8.4: DEEP JSON EXTRACTION FROM HTML
-# ==========================================
-
 def extract_post_id_from_url(url):
-    """Extract reel/video ID from URL"""
-    patterns = [
-        r'/reel/(\d+)',
-        r'/videos/(\d+)',
-        r'video\.php\?v=(\d+)',
-        r'/watch/\?v=(\d+)',
-    ]
-    for pat in patterns:
+    for pat in [r'/reel/(\d+)', r'/videos/(\d+)', r'video\.php\?v=(\d+)', r'/watch/\?v=(\d+)']:
         m = re.search(pat, url)
         if m:
             return m.group(1)
     return None
 
 
-def deep_extract_from_html(html, target_post_id, debug_info):
-    """
-    V8.4 CORE: Extract engagement data from FB HTML source code.
+# ==========================================
+# METADATA FROM HTML (always works)
+# ==========================================
+
+def extract_metadata_from_html(html):
+    data = {'caption': '', 'thumbnail': '', 'post_id': None, 'username': ''}
     
-    Strategy:
-    1. Find target post_id position in HTML
-    2. Extract data WITHIN proximity (±5000 chars) of post_id
-    3. Use JSON patterns to find exact values
-    4. Also search entire HTML for og: meta tags (caption, thumbnail)
-    """
-    data = {
-        'views': 0, 'likes': 0, 'comments': 0, 'shares': 0,
-        'caption': '', 'thumbnail': '', 'username': '', 'post_id': None,
-    }
+    # Post ID
+    for pat in [r'"video_id"\s*:\s*"(\d+)"', r'"post_id"\s*:\s*"(\d+)"', r'"top_level_post_id"\s*:\s*"(\d+)"']:
+        m = re.search(pat, html)
+        if m:
+            data['post_id'] = m.group(1)
+            break
     
-    debug_info['v84_method'] = 'deep_json'
-    debug_info['v84_html_length'] = len(html)
-    
-    # === STEP 1: Find target post_id in HTML ===
-    post_id = target_post_id
-    if not post_id:
-        # Try to find video_id from HTML
-        for pat in [
-            r'"video_id"\s*:\s*"(\d+)"',
-            r'"post_id"\s*:\s*"(\d+)"',
-            r'"top_level_post_id"\s*:\s*"(\d+)"',
-        ]:
-            m = re.search(pat, html)
-            if m:
-                post_id = m.group(1)
-                break
-    
-    data['post_id'] = post_id
-    debug_info['v84_post_id'] = post_id
-    
-    # === STEP 2: Extract METADATA (og: tags - reliable, always present) ===
+    # Caption
+    caption_candidates = []
     m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
     if m:
-        data['caption'] = m.group(1)
-    
-    # Longer caption from JSON
-    caption_pats = [
+        caption_candidates.append(m.group(1))
+    for pat in [
         r'"message"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)+)"',
         r'"text"\s*:\s*"((?:[^"\\]|\\.)+)"\s*,\s*"is_explicit_locale"',
-    ]
-    for pat in caption_pats:
+    ]:
         m = re.search(pat, html)
-        if m and len(m.group(1)) > len(data.get('caption', '')):
-            data['caption'] = m.group(1)
+        if m:
+            caption_candidates.append(m.group(1))
+    if caption_candidates:
+        caption_candidates.sort(key=len, reverse=True)
+        data['caption'] = caption_candidates[0]
     
+    # Thumbnail
     m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
     if m:
         data['thumbnail'] = decode_html_entities(m.group(1))
     
-    # === STEP 3: PROXIMITY-BASED ENGAGEMENT EXTRACTION ===
-    # Find ALL positions of post_id in HTML, extract data near each
-    if post_id:
-        positions = [m.start() for m in re.finditer(re.escape(post_id), html)]
-        debug_info['v84_post_id_positions'] = len(positions)
-        
-        # For each position, search ±5000 chars for engagement data
-        engagement_candidates = []
-        
-        for pos in positions[:20]:  # limit to first 20 occurrences
-            start = max(0, pos - 5000)
-            end = min(len(html), pos + 5000)
-            block = html[start:end]
-            
-            candidate = extract_engagement_from_block(block)
-            if candidate.get('likes', 0) > 0 or candidate.get('comments', 0) > 0:
-                engagement_candidates.append(candidate)
-        
-        debug_info['v84_engagement_candidates'] = len(engagement_candidates)
-        
-        # Pick the BEST candidate (most complete data)
-        if engagement_candidates:
-            best = max(engagement_candidates, 
-                       key=lambda c: (c.get('likes', 0) > 0) + (c.get('comments', 0) > 0) + (c.get('shares', 0) > 0))
-            data['likes'] = best.get('likes', 0)
-            data['comments'] = best.get('comments', 0)
-            data['shares'] = best.get('shares', 0)
-            debug_info['v84_engagement_source'] = 'proximity'
-    
-    # === STEP 4: VIEW COUNT - search entire HTML ===
-    # Views are sometimes in different JSON block than engagement
-    view_patterns = [
-        (r'"video_view_count"\s*:\s*(\d+)', 'video_view_count'),
-        (r'"play_count"\s*:\s*(\d+)', 'play_count'),
-        (r'"viewCount"\s*:\s*(\d+)', 'viewCount'),
-        (r'"reels_view_count"\s*:\s*(\d+)', 'reels_view_count'),
-    ]
-    
-    view_candidates = []
-    for pat, name in view_patterns:
-        matches = re.findall(pat, html)
-        for m in matches:
-            val = int(m)
-            if 10 <= val <= 1000000000:
-                # PROXIMITY CHECK: only accept if near target post_id
-                if post_id:
-                    match_obj = re.search(pat, html)
-                    if match_obj:
-                        match_pos = match_obj.start()
-                        # Find nearest post_id occurrence
-                        min_distance = float('inf')
-                        for pid_pos in [m2.start() for m2 in re.finditer(re.escape(post_id), html)]:
-                            dist = abs(match_pos - pid_pos)
-                            if dist < min_distance:
-                                min_distance = dist
-                        if min_distance < 5000:
-                            view_candidates.append({'value': val, 'pattern': name, 'distance': min_distance})
-                else:
-                    view_candidates.append({'value': val, 'pattern': name, 'distance': 0})
-    
-    debug_info['v84_view_candidates'] = view_candidates[:10]
-    
-    if view_candidates:
-        # Take the one closest to post_id
-        best_view = min(view_candidates, key=lambda v: v['distance'])
-        data['views'] = best_view['value']
-        debug_info['v84_views_source'] = best_view['pattern']
-    
-    # === STEP 5: USERNAME from HTML source ===
-    username_pats = [
-        r'"name"\s*:\s*"([^"]+)"\s*,\s*"(?:url|profile_url|id)"',
+    # Username
+    for pat in [
+        r'"name"\s*:\s*"([^"]+)"\s*,\s*"(?:url|profile_url)"',
         r'"owner"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
-        r'"actor"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
-    ]
-    for pat in username_pats:
+    ]:
         m = re.search(pat, html)
         if m:
             name = m.group(1)
@@ -314,86 +196,153 @@ def deep_extract_from_html(html, target_post_id, debug_info):
                 data['username'] = name
                 break
     
-    # === STEP 6: FALLBACK - if proximity extraction found nothing ===
-    if data['likes'] == 0 and data['comments'] == 0:
-        debug_info['v84_fallback'] = True
-        fallback = extract_engagement_global(html)
-        if fallback.get('likes', 0) > 0:
-            data['likes'] = fallback['likes']
-            data['comments'] = fallback.get('comments', 0)
-            data['shares'] = fallback.get('shares', 0)
-            debug_info['v84_engagement_source'] = 'global_fallback'
-    
     return data
 
 
-def extract_engagement_from_block(block):
-    """Extract engagement from a JSON block (±5000 chars around post_id)"""
-    result = {'likes': 0, 'comments': 0, 'shares': 0}
+# ==========================================
+# ENGAGEMENT FROM HTML (total_comment_count only)
+# ==========================================
+
+def extract_comments_from_html(html, target_post_id):
+    """HTML có total_comment_count - proximity match với post_id"""
+    if not target_post_id:
+        return 0
     
-    # Likes/reactions
-    likes_pats = [
-        r'"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-        r'"reactors"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-        r'"unified_reactors"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-        r'"reaction_count"\s*:\s*(\d+)',
-        r'"i18n_reaction_count"\s*:\s*"(\d+)',
-    ]
-    for pat in likes_pats:
-        m = re.search(pat, block)
-        if m:
-            val = int(m.group(1))
-            if val >= 0:
-                result['likes'] = val
-                break
+    pattern = r'"total_comment_count"\s*:\s*(\d+)'
+    matches = list(re.finditer(pattern, html))
     
-    # Comments
-    comments_pats = [
-        r'"total_comment_count"\s*:\s*(\d+)',
-        r'"comment_count"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)',
-        r'"comments"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)',
-        r'"total_count"\s*:\s*(\d+)\s*,\s*"[^"]*comment',
-    ]
-    for pat in comments_pats:
-        m = re.search(pat, block)
-        if m:
-            val = int(m.group(1))
-            if val >= 0:
-                result['comments'] = val
-                break
+    if not matches:
+        return 0
     
-    # Shares
-    shares_pats = [
-        r'"share_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-        r'"reshare_count"\s*:\s*(\d+)',
-        r'"share_count"\s*:\s*(\d+)',
-    ]
-    for pat in shares_pats:
-        m = re.search(pat, block)
-        if m:
-            val = int(m.group(1))
-            if val >= 0:
-                result['shares'] = val
-                break
+    # Find closest match to target post_id
+    post_positions = [m.start() for m in re.finditer(re.escape(target_post_id), html)]
+    if not post_positions:
+        # Fallback: return first match
+        return int(matches[0].group(1))
     
-    return result
+    best_val = 0
+    best_dist = float('inf')
+    for m in matches:
+        val = int(m.group(1))
+        for pp in post_positions:
+            dist = abs(m.start() - pp)
+            if dist < best_dist:
+                best_dist = dist
+                best_val = val
+    
+    return best_val
 
 
-def extract_engagement_global(html):
-    """Global fallback: find FIRST occurrence of engagement patterns in entire HTML"""
-    result = {'likes': 0, 'comments': 0, 'shares': 0}
+# ==========================================
+# ENGAGEMENT FROM NETWORK RESPONSES (likes, shares, views)
+# ==========================================
+
+def extract_engagement_from_network(captured_bodies, target_post_id, debug_info):
+    """
+    V8.5 CORE: Search captured GraphQL network responses for engagement data.
+    FB sends engagement via streaming JSON responses.
+    """
+    result = {'likes': 0, 'shares': 0, 'views': 0, 'comments_net': 0}
     
-    m = re.search(r'"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)', html)
-    if m:
-        result['likes'] = int(m.group(1))
+    debug_info['v85_network_bodies'] = len(captured_bodies)
+    debug_info['v85_network_total_size'] = sum(len(b) for b in captured_bodies)
     
-    m = re.search(r'"total_comment_count"\s*:\s*(\d+)', html)
-    if m:
-        result['comments'] = int(m.group(1))
+    likes_candidates = []
+    shares_candidates = []
+    views_candidates = []
+    comments_candidates = []
     
-    m = re.search(r'"share_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)', html)
-    if m:
-        result['shares'] = int(m.group(1))
+    for body in captured_bodies:
+        # Skip small or non-JSON bodies
+        if len(body) < 50:
+            continue
+        
+        # Check if this body contains target post_id
+        has_target = target_post_id and target_post_id in body
+        
+        # LIKES patterns
+        for pat in [
+            r'"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+            r'"reactors"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+            r'"i18n_reaction_count"\s*:\s*"(\d+)',
+            r'"reaction_count"\s*:\s*(\d+)',
+        ]:
+            for m in re.finditer(pat, body):
+                val = int(m.group(1))
+                if has_target:
+                    # Proximity check within this body
+                    pid_pos = body.find(target_post_id)
+                    dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
+                    likes_candidates.append({'value': val, 'distance': dist, 'in_target_body': True})
+                else:
+                    likes_candidates.append({'value': val, 'distance': 99999, 'in_target_body': False})
+        
+        # SHARES patterns
+        for pat in [
+            r'"share_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+            r'"reshare_count"\s*:\s*(\d+)',
+        ]:
+            for m in re.finditer(pat, body):
+                val = int(m.group(1))
+                if has_target:
+                    pid_pos = body.find(target_post_id)
+                    dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
+                    shares_candidates.append({'value': val, 'distance': dist, 'in_target_body': True})
+                else:
+                    shares_candidates.append({'value': val, 'distance': 99999, 'in_target_body': False})
+        
+        # VIEWS patterns
+        for pat in [
+            r'"video_view_count"\s*:\s*(\d+)',
+            r'"play_count"\s*:\s*(\d+)',
+            r'"viewCount"\s*:\s*(\d+)',
+            r'"reels_view_count"\s*:\s*(\d+)',
+        ]:
+            for m in re.finditer(pat, body):
+                val = int(m.group(1))
+                if 10 <= val <= 1000000000:
+                    if has_target:
+                        pid_pos = body.find(target_post_id)
+                        dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
+                        views_candidates.append({'value': val, 'distance': dist, 'in_target_body': True})
+                    else:
+                        views_candidates.append({'value': val, 'distance': 99999, 'in_target_body': False})
+        
+        # COMMENTS from network too
+        for pat in [r'"total_comment_count"\s*:\s*(\d+)']:
+            for m in re.finditer(pat, body):
+                val = int(m.group(1))
+                if has_target:
+                    pid_pos = body.find(target_post_id)
+                    dist = abs(m.start() - pid_pos) if pid_pos >= 0 else 99999
+                    comments_candidates.append({'value': val, 'distance': dist, 'in_target_body': True})
+    
+    # Pick best candidates: prefer in_target_body=True, then closest distance
+    def pick_best(candidates):
+        if not candidates:
+            return 0
+        # First try candidates in target body
+        target_cands = [c for c in candidates if c['in_target_body']]
+        if target_cands:
+            # Pick closest to post_id
+            best = min(target_cands, key=lambda c: c['distance'])
+            if best['distance'] < 5000:
+                return best['value']
+        return 0
+    
+    result['likes'] = pick_best(likes_candidates)
+    result['shares'] = pick_best(shares_candidates)
+    result['views'] = pick_best(views_candidates)
+    result['comments_net'] = pick_best(comments_candidates)
+    
+    debug_info['v85_likes_candidates'] = len(likes_candidates)
+    debug_info['v85_shares_candidates'] = len(shares_candidates)
+    debug_info['v85_views_candidates'] = len(views_candidates)
+    debug_info['v85_comments_candidates'] = len(comments_candidates)
+    
+    # Log first few for debugging
+    debug_info['v85_likes_samples'] = [{'val': c['value'], 'dist': c['distance'], 'target': c['in_target_body']} for c in likes_candidates[:5]]
+    debug_info['v85_views_samples'] = [{'val': c['value'], 'dist': c['distance'], 'target': c['in_target_body']} for c in views_candidates[:5]]
     
     return result
 
@@ -402,23 +351,11 @@ def extract_engagement_global(html):
 # SCRAPE ORCHESTRATOR
 # ==========================================
 
-def simulate_human(page):
-    try:
-        for _ in range(2):
-            page.mouse.move(random.randint(100, 1200), random.randint(100, 600))
-            time.sleep(random.uniform(0.3, 0.5))
-        page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
-        time.sleep(1)
-    except:
-        pass
-
-
 def scrape_with_playwright(url):
     cookies = parse_netscape_cookies(COOKIES_PATH)
     if not cookies:
         return {'success': False, 'error': 'No cookies loaded'}
     
-    # Pre-extract post_id from URL
     target_post_id = extract_post_id_from_url(url)
     
     result = {
@@ -431,10 +368,13 @@ def scrape_with_playwright(url):
         'debug': {
             'final_url': '', 'page_title': '',
             'cookies_count': len(cookies),
-            'version': '8.4-deep-source',
+            'version': '8.5-network-capture',
             'target_post_id_from_url': target_post_id,
         }
     }
+    
+    # Capture network responses
+    captured_bodies = []
     
     try:
         with sync_playwright() as p:
@@ -448,7 +388,6 @@ def scrape_with_playwright(url):
                 ]
             )
             
-            # SINGLE MODE: Desktop Chrome + cookies → deep HTML parse
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 viewport={'width': 1366, 'height': 768},
@@ -456,7 +395,7 @@ def scrape_with_playwright(url):
                 timezone_id='Asia/Ho_Chi_Minh',
                 extra_http_headers={
                     'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 }
             )
             context.add_cookies(cookies)
@@ -467,11 +406,41 @@ def scrape_with_playwright(url):
                 Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
             """)
             
+            # CAPTURE ALL NETWORK RESPONSES
+            def handle_response(resp):
+                try:
+                    if resp.status == 200:
+                        url_lower = resp.url.lower()
+                        # Capture GraphQL, API, and any JSON responses
+                        if any(k in url_lower for k in [
+                            'graphql', '/api/', 'ajax', 'relay', 
+                            'stream', 'comet', 'reels'
+                        ]):
+                            try:
+                                body = resp.text()
+                                if body and len(body) < 5000000:
+                                    captured_bodies.append(body)
+                            except:
+                                pass
+                except:
+                    pass
+            
+            page.on('response', handle_response)
+            
             logger.info(f'Navigating to: {url}')
             response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
-            time.sleep(8)
-            simulate_human(page)
-            time.sleep(2)
+            
+            # Wait for async streams to arrive
+            time.sleep(10)
+            
+            # Scroll to trigger more data loading
+            try:
+                page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
+                time.sleep(3)
+                page.evaluate('window.scrollTo({top: 0, behavior: "smooth"})')
+                time.sleep(2)
+            except:
+                pass
             
             final_url = page.url
             page_title = page.title()
@@ -483,32 +452,49 @@ def scrape_with_playwright(url):
                 browser.close()
                 return result
             
-            # Get full HTML source
+            # Get HTML for metadata
             html = page.content()
             result['debug']['html_length'] = len(html)
             
-            # If target_post_id not from URL, try from redirect URL
+            # Resolve post_id
             if not target_post_id:
                 target_post_id = extract_post_id_from_url(final_url)
-                result['debug']['target_post_id_from_redirect'] = target_post_id
+            if not target_post_id:
+                for pat in [r'"video_id"\s*:\s*"(\d+)"', r'"post_id"\s*:\s*"(\d+)"']:
+                    m = re.search(pat, html)
+                    if m:
+                        target_post_id = m.group(1)
+                        break
             
-            # === V8.4 DEEP EXTRACTION ===
-            extracted = deep_extract_from_html(html, target_post_id, result['debug'])
+            result['debug']['target_post_id'] = target_post_id
             
-            result['data']['views'] = extracted['views']
-            result['data']['likes'] = extracted['likes']
-            result['data']['comments'] = extracted['comments']
-            result['data']['shares'] = extracted['shares']
-            result['data']['post_id'] = extracted['post_id']
+            # === METADATA FROM HTML ===
+            metadata = extract_metadata_from_html(html)
+            result['data']['post_id'] = metadata['post_id'] or target_post_id
             result['data']['video_url'] = final_url
             
-            # Caption decode
-            raw_caption = extracted.get('caption', '')
+            raw_caption = metadata.get('caption', '')
             if raw_caption:
                 result['data']['caption'] = decode_unicode_string(raw_caption)[:5000]
+            result['data']['thumbnail'] = metadata.get('thumbnail', '')
+            result['data']['username'] = metadata.get('username', '')
             
-            result['data']['thumbnail'] = extracted.get('thumbnail', '')
-            result['data']['username'] = extracted.get('username', '')
+            # === COMMENTS FROM HTML (reliable) ===
+            html_comments = extract_comments_from_html(html, target_post_id)
+            
+            # === ENGAGEMENT FROM NETWORK (likes, shares, views) ===
+            # Also search HTML as additional "body" (it contains some streamed data)
+            all_bodies = captured_bodies + [html]
+            net_engagement = extract_engagement_from_network(all_bodies, target_post_id, result['debug'])
+            
+            # === COMBINE ===
+            result['data']['likes'] = net_engagement['likes']
+            result['data']['comments'] = max(html_comments, net_engagement['comments_net'])
+            result['data']['shares'] = net_engagement['shares']
+            result['data']['views'] = net_engagement['views']
+            
+            result['debug']['html_comments'] = html_comments
+            result['debug']['net_comments'] = net_engagement['comments_net']
             
             if (result['data']['views'] > 0 or
                 result['data']['likes'] > 0 or
@@ -531,7 +517,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.4-deep-source',
+        'version': '8.5-network-capture',
     })
 
 
@@ -553,7 +539,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.4-deep-source',
+        'version': '8.5-network-capture',
     })
 
 
@@ -569,112 +555,6 @@ def scrape_endpoint():
     logger.info(f'Scraping: {url}')
     result = scrape_with_playwright(url)
     return jsonify(result)
-
-
-@app.route('/debug-html', methods=['POST'])
-def debug_html_endpoint():
-    """
-    TEMPORARY DEBUG: Dump raw HTML snippets around post_id.
-    This helps understand FB's actual JSON format.
-    """
-    api_key = request.headers.get('X-API-Key') or request.headers.get('x-api-key')
-    if api_key != API_SECRET:
-        return jsonify({'error': 'Unauthorized'}), 401
-    data = request.get_json(silent=True) or {}
-    url = data.get('url', '')
-    if not url:
-        return jsonify({'error': 'Missing url'}), 400
-    
-    cookies = parse_netscape_cookies(COOKIES_PATH)
-    if not cookies:
-        return jsonify({'error': 'No cookies'})
-    
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                      '--disable-blink-features=AutomationControlled', '--disable-gpu']
-            )
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                viewport={'width': 1366, 'height': 768},
-                locale='vi-VN', timezone_id='Asia/Ho_Chi_Minh',
-                extra_http_headers={'Accept-Language': 'vi-VN,vi;q=0.9'}
-            )
-            context.add_cookies(cookies)
-            page = context.new_page()
-            page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
-            page.goto(url, wait_until='domcontentloaded', timeout=45000)
-            time.sleep(8)
-            page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
-            time.sleep(2)
-            
-            html = page.content()
-            final_url = page.url
-            context.close()
-            browser.close()
-    except Exception as e:
-        return jsonify({'error': str(e)})
-    
-    # Extract post_id
-    post_id = extract_post_id_from_url(url) or extract_post_id_from_url(final_url)
-    if not post_id:
-        for pat in [r'"video_id"\s*:\s*"(\d+)"', r'"post_id"\s*:\s*"(\d+)"']:
-            m = re.search(pat, html)
-            if m:
-                post_id = m.group(1)
-                break
-    
-    # Find snippets around post_id
-    snippets = []
-    if post_id:
-        for m in re.finditer(re.escape(post_id), html):
-            pos = m.start()
-            start = max(0, pos - 500)
-            end = min(len(html), pos + 500)
-            snippet = html[start:end]
-            # Only include snippets that have engagement-related keywords
-            keywords = ['reaction', 'comment', 'share', 'count', 'view', 'play', 'feedback']
-            if any(kw in snippet.lower() for kw in keywords):
-                snippets.append({
-                    'position': pos,
-                    'snippet': snippet,
-                })
-            if len(snippets) >= 10:
-                break
-    
-    # Also search for known engagement patterns globally
-    engagement_patterns_found = []
-    for pat_name, pat in [
-        ('reaction_count_obj', r'"reaction_count"\s*:\s*\{[^}]{0,100}\}'),
-        ('reaction_count_num', r'"reaction_count"\s*:\s*\d+'),
-        ('total_comment_count', r'"total_comment_count"\s*:\s*\d+'),
-        ('comment_total_count', r'"comments"\s*:\s*\{[^}]{0,100}"total_count"\s*:\s*\d+'),
-        ('share_count_obj', r'"share_count"\s*:\s*\{[^}]{0,100}\}'),
-        ('share_count_num', r'"share_count"\s*:\s*\d+'),
-        ('video_view_count', r'"video_view_count"\s*:\s*\d+'),
-        ('play_count', r'"play_count"\s*:\s*\d+'),
-        ('i18n_reaction_count', r'"i18n_reaction_count"\s*:\s*"[^"]*"'),
-        ('feedback', r'"feedback"\s*:\s*\{[^}]{0,200}'),
-    ]:
-        matches = re.findall(pat, html)
-        if matches:
-            engagement_patterns_found.append({
-                'pattern': pat_name,
-                'count': len(matches),
-                'samples': matches[:3],
-            })
-    
-    return jsonify({
-        'url': url,
-        'final_url': final_url,
-        'html_length': len(html),
-        'post_id': post_id,
-        'post_id_occurrences': len(list(re.finditer(re.escape(post_id), html))) if post_id else 0,
-        'snippets_with_engagement': snippets,
-        'engagement_patterns_found': engagement_patterns_found,
-    })
 
 
 if __name__ == '__main__':
