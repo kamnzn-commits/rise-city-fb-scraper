@@ -1,24 +1,28 @@
 """
-Rise City Facebook Scraper API - V8.2 🎩
-FIX TRIỆT ĐỂ BUG ENGAGEMENT LẪN VỚI RELATED REELS:
+Rise City Facebook Scraper API - V8.3 🎩
+ROOT CAUSE FIX - ICON MAPPING BY CODEPOINT:
 
-V8.1 BUG:
-- Mobile innertext có nhiều reels (chính + related)
-- icon_pattern_matches lấy hết → [7, 385, 2, 18K, 165, 33, ...]
-- Code lấy [0,1,2] → comments=385 SAI (đó là comments của reel khác)
+V8.1-V8.2 BUG:
+- Regex lấy [icon, number] theo thứ tự xuất hiện → SAI
+- Khi likes=0 hoặc shares=0, FB ẨN số → regex lấy nhầm số của icon khác
 
-V8.2 FIX:
-- ISOLATE engagement của TARGET reel only
-- Cắt innertext TRƯỚC marker "Watch more reels", "Còn nhiều nội dung khác", related
-- Chỉ lấy 3 icon đầu tiên TRONG ĐOẠN TARGET
-- Verify post_id match trước khi accept
+V8.3 FIX:
+- Map theo Unicode codepoint chính xác:
+  U+F0378 (󰍸) = LIKE icon
+  U+F0379 (󰍹) = COMMENT icon
+  U+F037A (󰍺) = SHARE icon
+  U+F174D (󱝍) = EYE/VIEW icon
+- Tìm ICON → số NGAY SAU nó (1-2 dòng)
+- Nếu gặp ICON khác trước khi gặp số → metric = 0 (FB ẩn)
+- Chỉ lấy FIRST occurrence (target reel, không related)
+- Kết hợp isolation (V8.2) để chặn related reels
 
 5 ATTEMPTS PER REQUEST (giữ nguyên):
-1. Cookies + Desktop Chrome (engagement + metadata)
-2. NO cookies + iPhone 15 Pro Safari (anonymous views)
-3. NO cookies + Android Galaxy S24 (anonymous views)
-4. Cookies + mbasic.facebook.com (text-only)
-5. Cookies + mobile m.facebook.com (engagement với fix isolate)
+1. Desktop Chrome + cookies (metadata)
+2. iPhone 15 Pro anonymous (views)
+3. Android S24 anonymous (views)
+4. mbasic.facebook.com (views)
+5. Mobile m.facebook.com (engagement with icon-mapping fix)
 """
 from flask import Flask, request, jsonify, make_response
 from playwright.sync_api import sync_playwright
@@ -49,7 +53,12 @@ USERNAME_BLACKLIST = {
     'developers', 'directory', 'badges', 'feed', 'timeline'
 }
 
-# Markers báo hiệu kết thúc target reel, bắt đầu related reels
+# Facebook PUA icon codepoints
+ICON_LIKE  = '\U000F0378'  # 󰍸
+ICON_CMT   = '\U000F0379'  # 󰍹
+ICON_SHARE = '\U000F037A'  # 󰍺
+ICON_EYE   = '\U000F174D'  # 󱝍
+
 RELATED_MARKERS = [
     'Watch more reels like this',
     'C\u00f2n nhi\u1ec1u n\u1ed9i dung kh\u00e1c',
@@ -57,7 +66,6 @@ RELATED_MARKERS = [
     'H\u00e3y \u0111\u0103ng nh\u1eadp \u0111\u1ec3 kh\u00e1m ph\u00e1',
     'Ti\u1ebfp t\u1ee5c d\u01b0\u1edbi t\u00ean',
     '\u0110\u0103ng nh\u1eadp \u0111\u1ec3 k\u1ebft n\u1ed1i',
-    'Related',
     'See more reels',
 ]
 
@@ -106,7 +114,6 @@ def parse_netscape_cookies(cookies_path):
     cookies = []
     if not os.path.exists(cookies_path):
         return cookies
-    
     with open(cookies_path, 'r') as f:
         for line in f:
             line = line.strip()
@@ -133,7 +140,6 @@ def parse_vietnamese_number(text):
         return 0
     num_str = match.group(1)
     suffix = match.group(2)
-    
     if ',' in num_str and '.' in num_str:
         num_str = num_str.replace(',', '')
     elif ',' in num_str:
@@ -146,12 +152,10 @@ def parse_vietnamese_number(text):
         parts = num_str.split('.')
         if len(parts) == 2 and len(parts[1]) == 3:
             num_str = num_str.replace('.', '')
-    
     try:
         num = float(num_str)
     except:
         return 0
-    
     if suffix:
         suffix = suffix.lower()
         if 'k' in suffix:
@@ -165,102 +169,108 @@ def parse_vietnamese_number(text):
     return int(num)
 
 
-def isolate_target_innertext(innertext, debug_info):
-    """
-    NEW V8.2: Cắt innertext chỉ giữ phần TARGET reel, bỏ related reels.
-    
-    Mobile innertext structure:
-    ┌─────────────────────────────┐
-    │ [icons] [target reel data]  │ ← PHẦN NÀY GIỮ
-    │ Watch more reels like this  │ ← MARKER
-    │ [related reel 1]            │ ← BỎ
-    │ [related reel 2]            │ ← BỎ
-    │ Đăng nhập để khám phá...    │ ← BỎ
-    └─────────────────────────────┘
-    """
+def isolate_target_innertext(innertext):
+    """Cắt innertext chỉ giữ phần TARGET reel, bỏ related"""
     if not innertext:
         return ''
-    
-    # Find earliest marker position
     cut_pos = len(innertext)
-    matched_marker = None
-    
     for marker in RELATED_MARKERS:
         pos = innertext.find(marker)
         if pos > 0 and pos < cut_pos:
             cut_pos = pos
-            matched_marker = marker
-    
-    debug_info['isolation_marker'] = matched_marker
-    debug_info['isolation_cut_pos'] = cut_pos
-    debug_info['isolation_original_length'] = len(innertext)
-    
-    isolated = innertext[:cut_pos]
-    debug_info['isolation_result_length'] = len(isolated)
-    
-    return isolated
+    return innertext[:cut_pos]
 
 
-def parse_mobile_engagement(innertext, debug_info):
+def find_number_after_line(lines, start_idx, max_look=2):
     """
-    V8.2 FIX: Parse engagement chỉ từ TARGET reel (đã isolate).
+    V8.3 CORE: Tìm số NGAY SAU dòng start_idx (1-2 dòng tiếp).
+    Nếu gặp icon khác hoặc text dài trước khi gặp số → return None (metric=0).
+    """
+    for i in range(start_idx + 1, min(start_idx + 1 + max_look, len(lines))):
+        line = lines[i].strip()
+        if not line:
+            continue
+        # Check if line IS a number
+        if re.match(r'^[\d.,]+\s*[KkMmBb]?$', line):
+            return line
+        # Check if line contains ANY PUA icon → stop (another metric starts)
+        has_icon = any(ord(c) > 0xF0000 for c in line)
+        if has_icon:
+            return None
+        # Check if line is text content (username, caption, etc) → stop
+        if len(line) > 3 and not line[0].isdigit():
+            return None
+    return None
+
+
+def parse_mobile_engagement_v83(innertext, debug_info):
+    """
+    V8.3: Parse engagement bằng icon codepoint mapping.
     
-    Logic:
-    1. Isolate target portion
-    2. Find first 3 icon-number patterns
-    3. Map: [0]=likes, [1]=comments, [2]=shares
+    FB mobile reel innertext structure:
+    - LIKE_ICON  (nếu likes>0 → số ngay sau, nếu likes=0 → icon tiếp theo ngay)
+    - CMT_ICON   (nếu comments>0 → số ngay sau)
+    - SHARE_ICON (nếu shares>0 → số ngay sau)
+    - Username
+    - Caption
+    - ...related reels
+    
+    Logic: Tìm FIRST occurrence của mỗi icon trong isolated text,
+    check số ngay sau. Nếu không có số → metric = 0.
     """
     data = {'likes': 0, 'comments': 0, 'shares': 0}
     
     if not innertext:
         return data
     
-    # ISOLATE first
-    target_text = isolate_target_innertext(innertext, debug_info)
+    # Isolate target reel
+    target_text = isolate_target_innertext(innertext)
+    lines = target_text.split('\n')
     
-    # Pattern: icon (PUA char) + newline + number + newline
-    icon_number_pattern = r'[\U000F0000-\U000FFFFD]\s*\n\s*([\d.,]+\s*[KkMmBb]?)\s*\n'
-    matches = re.findall(icon_number_pattern, target_text)
+    debug_info['v83_isolated_length'] = len(target_text)
     
-    debug_info['icon_pattern_matches_isolated'] = matches[:10]
+    found_like = False
+    found_cmt = False
+    found_share = False
     
-    # Verify: target reel chỉ nên có 3-4 icons (likes, comments, shares)
-    # Nếu > 6 icons → có thể isolation chưa đủ chặt
-    if len(matches) > 6:
-        debug_info['isolation_warning'] = f'Too many icons ({len(matches)}) - taking first 3'
+    for i, line in enumerate(lines):
+        for c in line:
+            cp = ord(c)
+            if cp == ord(ICON_LIKE) and not found_like:
+                found_like = True
+                val = find_number_after_line(lines, i)
+                data['likes'] = parse_vietnamese_number(val) if val else 0
+                debug_info['v83_like_raw'] = val
+            elif cp == ord(ICON_CMT) and not found_cmt:
+                found_cmt = True
+                val = find_number_after_line(lines, i)
+                data['comments'] = parse_vietnamese_number(val) if val else 0
+                debug_info['v83_cmt_raw'] = val
+            elif cp == ord(ICON_SHARE) and not found_share:
+                found_share = True
+                val = find_number_after_line(lines, i)
+                data['shares'] = parse_vietnamese_number(val) if val else 0
+                debug_info['v83_share_raw'] = val
     
-    # Take FIRST 3 (target reel)
-    if len(matches) >= 3:
-        data['likes'] = parse_vietnamese_number(matches[0])
-        data['comments'] = parse_vietnamese_number(matches[1])
-        data['shares'] = parse_vietnamese_number(matches[2])
-    elif len(matches) == 2:
-        data['likes'] = parse_vietnamese_number(matches[0])
-        data['comments'] = parse_vietnamese_number(matches[1])
-    elif len(matches) == 1:
-        data['likes'] = parse_vietnamese_number(matches[0])
-    
+    debug_info['v83_engagement'] = data
     return data
 
 
 def search_views_in_text(text):
-    """Search Vietnamese view patterns + JSON patterns in any text"""
+    """Search Vietnamese view patterns + JSON patterns"""
     candidates = []
-    
     patterns = [
         r'([\d.,]+\s*[KkMmBb]?)\s*l\u01b0\u1ee3t\s*xem',
         r'([\d.,]+\s*[KkMmBb]?)\s*l\\u01b0\\u1ee3t\s*xem',
         r'([\d.,]+\s*[KkMmBb]?)\s*l\u1ea7n\s*xem',
         r'([\d.,]+\s*[KkMmBb]?)\s*views?\b',
     ]
-    
     for pat in patterns:
         matches = re.findall(pat, text, re.IGNORECASE)
         for m in matches[:30]:
             value = parse_vietnamese_number(m)
             if 10 <= value <= 1000000000:
                 candidates.append(value)
-    
     json_patterns = [
         r'"video_view_count"\s*:\s*(\d+)',
         r'"play_count"\s*:\s*(\d+)',
@@ -268,7 +278,6 @@ def search_views_in_text(text):
         r'"reels_view_count"\s*:\s*(\d+)',
         r'"organic_view_count"\s*:\s*(\d+)',
     ]
-    
     for pat in json_patterns:
         matches = re.findall(pat, text)
         for m in matches:
@@ -278,16 +287,7 @@ def search_views_in_text(text):
                     candidates.append(val)
             except:
                 pass
-    
     return max(candidates) if candidates else 0
-
-
-def search_views_in_target_text(text, debug_info):
-    """
-    V8.2 NEW: Search views chỉ trong TARGET portion (trước related markers)
-    """
-    target_text = isolate_target_innertext(text, debug_info)
-    return search_views_in_text(target_text)
 
 
 def simulate_human(page):
@@ -307,7 +307,6 @@ def simulate_human(page):
 # ==========================================
 # FINGERPRINTS
 # ==========================================
-
 FINGERPRINT_IPHONE_15 = {
     'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
     'viewport': {'width': 393, 'height': 852},
@@ -317,13 +316,10 @@ FINGERPRINT_IPHONE_15 = {
     'extra_headers': {
         'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
         'Referer': 'https://www.google.com/',
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'cross-site',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
     }
 }
 
@@ -337,22 +333,17 @@ FINGERPRINT_ANDROID_S24 = {
         'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Referer': 'https://www.google.com/search?q=facebook+reel',
-        'sec-ch-ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+        'sec-ch-ua': '"Google Chrome";v="124", "Chromium";v="124"',
         'sec-ch-ua-mobile': '?1',
         'sec-ch-ua-platform': '"Android"',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'cross-site',
-        'Upgrade-Insecure-Requests': '1',
     }
 }
 
 
 def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
-    """Anonymous mode for views (unchanged from V8.1)"""
+    """Anonymous mode for views"""
     try:
         debug_info[f'{name}_attempted'] = True
-        
         context = browser.new_context(
             user_agent=fingerprint['user_agent'],
             viewport=fingerprint['viewport'],
@@ -363,24 +354,12 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
             timezone_id='Asia/Ho_Chi_Minh',
             extra_http_headers=fingerprint['extra_headers'],
         )
-        
         page = context.new_page()
-        
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
             window.chrome = { runtime: {} };
-            const originalQuery = window.navigator.permissions?.query;
-            if (originalQuery) {
-                window.navigator.permissions.query = (params) => (
-                    params.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission })
-                        : originalQuery(params)
-                );
-            }
-            Object.defineProperty(screen, 'availWidth', { get: () => 1366 });
-            Object.defineProperty(screen, 'availHeight', { get: () => 768 });
         """)
         
         captured_responses = []
@@ -388,7 +367,7 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
             try:
                 if response.status == 200:
                     url_lower = response.url.lower()
-                    if any(k in url_lower for k in ['graphql', 'reel', 'video', 'fb_dtsg', 'jsmods']):
+                    if any(k in url_lower for k in ['graphql', 'reel', 'video']):
                         try:
                             body = response.text()
                             if body and len(body) < 3000000:
@@ -400,33 +379,23 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
         page.on('response', handle_response)
         
         logger.info(f'{name} navigating to: {url}')
-        response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
-        
+        page.goto(url, wait_until='domcontentloaded', timeout=45000)
         time.sleep(random.uniform(3, 6))
         
         try:
-            page.evaluate("""
-                () => {
-                    const dialogs = document.querySelectorAll('[role="dialog"]');
-                    dialogs.forEach(d => {
-                        const text = d.textContent || '';
-                        if (text.includes('\u0110\u0103ng nh\u1eadp') || text.includes('Log in')) {
-                            d.style.display = 'none';
-                        }
-                    });
-                    const overlays = document.querySelectorAll('[data-testid*="login"], [aria-label*="\u0110\u0103ng nh\u1eadp"]');
-                    overlays.forEach(o => o.style.display = 'none');
-                }
-            """)
+            page.evaluate("""() => {
+                document.querySelectorAll('[role="dialog"]').forEach(d => {
+                    if ((d.textContent||'').includes('Đăng nhập') || (d.textContent||'').includes('Log in'))
+                        d.style.display = 'none';
+                });
+            }""")
             time.sleep(1)
         except:
             pass
         
         try:
-            page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
-            time.sleep(2)
-            page.evaluate('window.scrollTo({top: 600, behavior: "smooth"})')
-            time.sleep(2)
+            page.evaluate('window.scrollTo({top: 400, behavior: "smooth"})')
+            time.sleep(3)
         except:
             pass
         
@@ -448,16 +417,9 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
             context.close()
             return 0
         
-        # V8.2: Search views in TARGET portion only (avoid related reels)
         all_text = '\n'.join([html, innertext] + captured_responses)
-        views = search_views_in_target_text(all_text, debug_info)
-        
+        views = search_views_in_text(all_text)
         debug_info[f'{name}_views_found'] = views
-        debug_info[f'{name}_html_keywords'] = {
-            'has_luot_xem': 'l\\u01b0\\u1ee3t xem' in html,
-            'has_video_view_count': 'video_view_count' in html,
-            'has_play_count': 'play_count' in html,
-        }
         
         context.close()
         return views
@@ -468,10 +430,9 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
 
 
 def try_mbasic_for_views(browser, url, cookies, debug_info):
-    """mbasic.facebook.com - text-only mobile site"""
+    """mbasic.facebook.com text-only"""
     try:
         debug_info['mbasic_attempted'] = True
-        
         mbasic_url = url.replace('www.facebook.com', 'mbasic.facebook.com')
         if 'mbasic.facebook.com' not in mbasic_url:
             mbasic_url = mbasic_url.replace('facebook.com', 'mbasic.facebook.com')
@@ -482,12 +443,9 @@ def try_mbasic_for_views(browser, url, cookies, debug_info):
             locale='vi-VN',
             timezone_id='Asia/Ho_Chi_Minh',
         )
-        
         context.add_cookies(cookies)
         page = context.new_page()
-        
-        logger.info(f'mbasic navigating to: {mbasic_url}')
-        response = page.goto(mbasic_url, wait_until='domcontentloaded', timeout=30000)
+        page.goto(mbasic_url, wait_until='domcontentloaded', timeout=30000)
         time.sleep(4)
         
         html = page.content()
@@ -501,14 +459,13 @@ def try_mbasic_for_views(browser, url, cookies, debug_info):
         debug_info['mbasic_innertext_length'] = len(innertext)
         debug_info['mbasic_innertext_preview'] = innertext[:500]
         
-        all_text = html + '\n' + innertext
-        views = search_views_in_target_text(all_text, debug_info)
+        views = search_views_in_text(html + '\n' + innertext)
         debug_info['mbasic_views_found'] = views
         
         context.close()
         return views
     except Exception as e:
-        logger.warning(f'mbasic mode failed: {e}')
+        logger.warning(f'mbasic failed: {e}')
         debug_info['mbasic_error'] = str(e)[:200]
         return 0
 
@@ -532,7 +489,7 @@ def scrape_with_playwright(url):
             'mode_used': '',
             'tried_modes': [],
             'view_sources': {},
-            'version': '8.2-isolation-fix',
+            'version': '8.3-icon-mapping',
         }
     }
     
@@ -541,13 +498,10 @@ def scrape_with_playwright(url):
             browser = p.chromium.launch(
                 headless=True,
                 args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
+                    '--no-sandbox', '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-blink-features=AutomationControlled',
-                    '--disable-gpu',
-                    '--no-first-run',
-                    '--disable-infobars',
+                    '--disable-gpu', '--no-first-run', '--disable-infobars',
                 ]
             )
             
@@ -575,8 +529,9 @@ def scrape_with_playwright(url):
             if final_views > 0:
                 result['data']['views'] = final_views
             
-            if (result['data']['views'] > 0 or 
+            if (result['data']['views'] > 0 or
                 result['data']['likes'] > 0 or
+                result['data']['comments'] > 0 or
                 result['data']['caption']):
                 result['success'] = True
     except Exception as e:
@@ -588,10 +543,9 @@ def scrape_with_playwright(url):
 
 
 def try_desktop_with_cookies(browser, url, cookies, result):
-    """Mode 1: Desktop with cookies for engagement + metadata"""
+    """Mode 1: Desktop with cookies for metadata"""
     try:
         result['debug']['tried_modes'].append('desktop_cookies')
-        
         context = browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport={'width': 1366, 'height': 768},
@@ -602,17 +556,15 @@ def try_desktop_with_cookies(browser, url, cookies, result):
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             }
         )
-        
         context.add_cookies(cookies)
         page = context.new_page()
-        
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en'] });
         """)
         
-        response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
+        page.goto(url, wait_until='domcontentloaded', timeout=45000)
         time.sleep(7)
         simulate_human(page)
         time.sleep(2)
@@ -630,8 +582,7 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         html = page.content()
         result['debug']['html_length'] = len(html)
         
-        # V8.2: Search views with isolation
-        views = search_views_in_text(html)  # HTML không có related markers như innertext
+        views = search_views_in_text(html)
         
         extracted = extract_metadata_from_html(html)
         result['debug']['extracted_data'] = extracted
@@ -661,10 +612,7 @@ def try_desktop_with_cookies(browser, url, cookies, result):
 
 
 def try_mobile_mode(browser, url, cookies, result):
-    """
-    Mode 5: Mobile m.facebook.com for engagement
-    V8.2 FIX: Isolate target reel before parsing engagement
-    """
+    """Mode 5: Mobile with V8.3 icon-mapping engagement"""
     try:
         result['debug']['tried_modes'].append('mobile_cookies')
         
@@ -682,11 +630,10 @@ def try_mobile_mode(browser, url, cookies, result):
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             }
         )
-        
         context.add_cookies(cookies)
         page = context.new_page()
         
-        response = page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
+        page.goto(mobile_url, wait_until='domcontentloaded', timeout=45000)
         time.sleep(random.uniform(5, 6))
         
         for offset in [200, 400]:
@@ -705,18 +652,18 @@ def try_mobile_mode(browser, url, cookies, result):
         except:
             pass
         
-        # V8.2: parse_mobile_engagement now uses isolation internally
-        engagement = parse_mobile_engagement(mobile_innertext, result['debug'])
+        # V8.3: Parse engagement with icon-mapping
+        engagement = parse_mobile_engagement_v83(mobile_innertext, result['debug'])
         
-        if engagement.get('likes', 0) > 0:
-            result['data']['likes'] = engagement['likes']
-        if engagement.get('comments', 0) > 0:
-            result['data']['comments'] = engagement['comments']
-        if engagement.get('shares', 0) > 0:
-            result['data']['shares'] = engagement['shares']
+        # Always update (even if 0, that's correct for hidden metrics)
+        result['data']['likes'] = engagement['likes']
+        result['data']['comments'] = engagement['comments']
+        result['data']['shares'] = engagement['shares']
         
+        # Also search views in mobile innertext
         if mobile_innertext:
-            mobile_views = search_views_in_target_text(mobile_innertext, result['debug'])
+            target_text = isolate_target_innertext(mobile_innertext)
+            mobile_views = search_views_in_text(target_text)
             if mobile_views > 0:
                 result['debug']['view_sources']['mobile_cookies'] = mobile_views
                 if mobile_views > result['data']['views']:
@@ -747,7 +694,6 @@ def extract_username_from_dom(page):
                 return results.slice(0, 20);
             }
         """)
-        
         if js_results:
             for m in js_results:
                 username = m.get('username', '').lower()
@@ -756,13 +702,11 @@ def extract_username_from_dom(page):
                     break
     except:
         pass
-    
     return data
 
 
 def extract_metadata_from_html(html):
     data = {}
-    
     for pat in [
         r'"video_id"\s*:\s*"(\d+)"',
         r'"top_level_post_id"\s*:\s*"(\d+)"',
@@ -773,11 +717,9 @@ def extract_metadata_from_html(html):
             break
     
     caption_candidates = []
-    
     m = re.search(r'<meta\s+property="og:description"\s+content="([^"]+)"', html)
     if m:
         caption_candidates.append(m.group(1))
-    
     for pat in [
         r'"message"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)+)"',
         r'"text"\s*:\s*"((?:[^"\\]|\\.)+)"\s*,\s*"is_explicit_locale"',
@@ -786,7 +728,6 @@ def extract_metadata_from_html(html):
         m = re.search(pat, html)
         if m:
             caption_candidates.append(m.group(1))
-    
     if caption_candidates:
         caption_candidates.sort(key=len, reverse=True)
         data['caption'] = caption_candidates[0]
@@ -808,7 +749,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.2-isolation-fix',
+        'version': '8.3-icon-mapping',
     })
 
 
@@ -816,7 +757,6 @@ def home():
 def health():
     cookies_exist = os.path.exists(COOKIES_PATH)
     cookies_count = len(parse_netscape_cookies(COOKIES_PATH)) if cookies_exist else 0
-    
     chromium_ok = False
     chromium_path = None
     try:
@@ -825,14 +765,13 @@ def health():
             chromium_ok = os.path.exists(chromium_path) if chromium_path else False
     except Exception as e:
         chromium_path = f'Error: {e}'
-    
     return jsonify({
         'status': 'ok',
         'cookies_loaded': cookies_exist,
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.2-isolation-fix',
+        'version': '8.3-icon-mapping',
     })
 
 
@@ -841,13 +780,10 @@ def scrape_endpoint():
     api_key = request.headers.get('X-API-Key') or request.headers.get('x-api-key')
     if api_key != API_SECRET:
         return jsonify({'error': 'Unauthorized'}), 401
-    
     data = request.get_json(silent=True) or {}
     url = data.get('url', '')
-    
     if not url:
         return jsonify({'error': 'Missing url'}), 400
-    
     logger.info(f'Scraping: {url}')
     result = scrape_with_playwright(url)
     return jsonify(result)
