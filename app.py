@@ -571,6 +571,112 @@ def scrape_endpoint():
     return jsonify(result)
 
 
+@app.route('/debug-html', methods=['POST'])
+def debug_html_endpoint():
+    """
+    TEMPORARY DEBUG: Dump raw HTML snippets around post_id.
+    This helps understand FB's actual JSON format.
+    """
+    api_key = request.headers.get('X-API-Key') or request.headers.get('x-api-key')
+    if api_key != API_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    url = data.get('url', '')
+    if not url:
+        return jsonify({'error': 'Missing url'}), 400
+    
+    cookies = parse_netscape_cookies(COOKIES_PATH)
+    if not cookies:
+        return jsonify({'error': 'No cookies'})
+    
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                      '--disable-blink-features=AutomationControlled', '--disable-gpu']
+            )
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                viewport={'width': 1366, 'height': 768},
+                locale='vi-VN', timezone_id='Asia/Ho_Chi_Minh',
+                extra_http_headers={'Accept-Language': 'vi-VN,vi;q=0.9'}
+            )
+            context.add_cookies(cookies)
+            page = context.new_page()
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+            page.goto(url, wait_until='domcontentloaded', timeout=45000)
+            time.sleep(8)
+            page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
+            time.sleep(2)
+            
+            html = page.content()
+            final_url = page.url
+            context.close()
+            browser.close()
+    except Exception as e:
+        return jsonify({'error': str(e)})
+    
+    # Extract post_id
+    post_id = extract_post_id_from_url(url) or extract_post_id_from_url(final_url)
+    if not post_id:
+        for pat in [r'"video_id"\s*:\s*"(\d+)"', r'"post_id"\s*:\s*"(\d+)"']:
+            m = re.search(pat, html)
+            if m:
+                post_id = m.group(1)
+                break
+    
+    # Find snippets around post_id
+    snippets = []
+    if post_id:
+        for m in re.finditer(re.escape(post_id), html):
+            pos = m.start()
+            start = max(0, pos - 500)
+            end = min(len(html), pos + 500)
+            snippet = html[start:end]
+            # Only include snippets that have engagement-related keywords
+            keywords = ['reaction', 'comment', 'share', 'count', 'view', 'play', 'feedback']
+            if any(kw in snippet.lower() for kw in keywords):
+                snippets.append({
+                    'position': pos,
+                    'snippet': snippet,
+                })
+            if len(snippets) >= 10:
+                break
+    
+    # Also search for known engagement patterns globally
+    engagement_patterns_found = []
+    for pat_name, pat in [
+        ('reaction_count_obj', r'"reaction_count"\s*:\s*\{[^}]{0,100}\}'),
+        ('reaction_count_num', r'"reaction_count"\s*:\s*\d+'),
+        ('total_comment_count', r'"total_comment_count"\s*:\s*\d+'),
+        ('comment_total_count', r'"comments"\s*:\s*\{[^}]{0,100}"total_count"\s*:\s*\d+'),
+        ('share_count_obj', r'"share_count"\s*:\s*\{[^}]{0,100}\}'),
+        ('share_count_num', r'"share_count"\s*:\s*\d+'),
+        ('video_view_count', r'"video_view_count"\s*:\s*\d+'),
+        ('play_count', r'"play_count"\s*:\s*\d+'),
+        ('i18n_reaction_count', r'"i18n_reaction_count"\s*:\s*"[^"]*"'),
+        ('feedback', r'"feedback"\s*:\s*\{[^}]{0,200}'),
+    ]:
+        matches = re.findall(pat, html)
+        if matches:
+            engagement_patterns_found.append({
+                'pattern': pat_name,
+                'count': len(matches),
+                'samples': matches[:3],
+            })
+    
+    return jsonify({
+        'url': url,
+        'final_url': final_url,
+        'html_length': len(html),
+        'post_id': post_id,
+        'post_id_occurrences': len(list(re.finditer(re.escape(post_id), html))) if post_id else 0,
+        'snippets_with_engagement': snippets,
+        'engagement_patterns_found': engagement_patterns_found,
+    })
+
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
