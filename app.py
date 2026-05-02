@@ -1,28 +1,31 @@
 """
-Rise City Facebook Scraper API - V8.9 🎩 ANTI-503 + DATA QUALITY
-BASE: V8.8
-PATCH MỚI V8.9 (FIX 503 + DETECT INCOMPLETE DATA):
-  CONCURRENCY:
-  - Tăng Semaphore từ 1 → 2 (cho phép 2 request song song)
-  - Tăng SCRAPE_LOCK_TIMEOUT từ 5s → 10s (đợi lâu hơn trước khi reject)
-  - Hỗ trợ X-Bypass-Lock header (skip semaphore cho retry)
+Rise City Facebook Scraper API - V8.10 🎩 ENGAGEMENT FROM HTML JSON
+BASE: V8.9
+PATCH MỚI V8.10 (FIX TRIỆT ĐỂ LIKES/COMMENTS/SHARES = 0):
+  ROOT CAUSE: Mobile mode bị FB login wall → engagement extraction = 0
   
-  DATA QUALITY:
-  - Đánh giá data_quality: complete | partial | incomplete_*
-  - Detect "zero_engagement_with_views": views > 100 mà likes=0,
-    comments=0, shares=0 (bất thường)
-  - Detect "missing_thumbnail": thiếu URL ảnh
-  - Detect "zero_views": views = 0 (chưa load hoặc video private)
-  - Trả flag should_retry để frontend biết cần quét lại
-  - Trả can_bypass khi 503 (frontend dùng X-Bypass-Lock retry)
+  GIẢI PHÁP V8.10:
+  - Thêm hàm extract_engagement_from_html() parse JSON patterns trong HTML
+  - Patterns:
+    * LIKES: reaction_count, i18n_reaction_count, top_reactions, reactor_count
+    * COMMENTS: comment_count, total_comment_count, i18n_comment_count
+    * SHARES: share_count, i18n_share_count, reshare_count
+  - Window search: 5000 chars quanh post_id (chính xác)
+  - Fallback: full HTML search nếu không có post_id
+  - Priority order: ưu tiên field FB UI hiển thị
+  - Sanity check: < 1M để loại bỏ page total
+  
+  INTEGRATION:
+  - Áp dụng trong try_desktop_with_cookies (mode 1)
+  - Giữ nguyên mobile mode logic (mobile vẫn ưu tiên nếu work)
+  - V8.10 chỉ kick in khi mobile fail hoặc trả 0
 
-LOGIC HOÀN CHỈNH V8.9:
-1. Request đến → check semaphore (max 2 concurrent)
-2. Nếu busy → 503 + can_bypass=true
-3. Frontend retry với X-Bypass-Lock=true → bỏ qua semaphore
-4. Sau khi scrape → đánh giá data_quality
-5. Nếu incomplete → trả should_retry=true
-6. Frontend tự động quét lại sau 30s
+LOGIC HOÀN CHỈNH V8.10:
+1. Desktop mode → extract views + V8.10 engagement (NEW)
+2. Mobile mode → backup engagement (nếu desktop fail)
+3. /videos/ URL fallback → views (nếu cần)
+4. Reel Grid → views fallback
+5. VN Proxy → last resort
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -359,6 +362,168 @@ def search_views_in_text(text):
                 pass
     
     return max(candidates) if candidates else 0
+
+
+# ==========================================
+# V8.10: EXTRACT ENGAGEMENT FROM HTML JSON
+# Mobile mode bị login wall → engagement=0
+# Desktop mode có HTML đầy đủ với JSON engagement → cần extract
+# ==========================================
+
+def extract_engagement_from_html(html, post_id=None, debug_info=None):
+    """
+    V8.10: Extract likes/comments/shares từ JSON pattern trong HTML.
+    
+    FB lưu engagement trong nhiều patterns:
+    - "reaction_count":{"count":XXX}
+    - "comment_count":{"total_count":XXX}  
+    - "share_count":{"count":XXX}
+    - "i18n_reaction_count":"XXX"
+    - "feedback":{"reaction_count":...}
+    
+    Strategy:
+    1. Tìm post_id position trong HTML
+    2. Tìm engagement patterns trong window quanh post_id (5000 chars)
+    3. Nếu không tìm được trong window → fallback search toàn HTML
+    
+    Returns: {'likes': int, 'comments': int, 'shares': int}
+    """
+    result = {'likes': 0, 'comments': 0, 'shares': 0}
+    
+    if not html:
+        return result
+    
+    if debug_info is None:
+        debug_info = {}
+    
+    # Find post_id position
+    post_id_pos = -1
+    if post_id:
+        post_id_pos = html.find(f'"{post_id}"')
+        debug_info['v810_post_id_pos'] = post_id_pos
+    
+    # Search window
+    if post_id_pos > 0:
+        window_start = max(0, post_id_pos - 1000)
+        window_end = min(len(html), post_id_pos + 10000)
+        search_html = html[window_start:window_end]
+        debug_info['v810_search_strategy'] = 'window'
+    else:
+        search_html = html
+        debug_info['v810_search_strategy'] = 'full_html'
+    
+    # === LIKES patterns ===
+    likes_patterns = [
+        # Reaction count với object wrapper
+        (r'"reaction_count"\s*:\s*\{[^}]*?"count"\s*:\s*(\d+)', 'reaction_count_obj'),
+        # I18n reaction count (string format)
+        (r'"i18n_reaction_count"\s*:\s*"([\d,\.KkMmBb]+)"', 'i18n_reaction_count'),
+        # Top reactions
+        (r'"top_reactions"\s*:\s*\{[^}]*?"count"\s*:\s*(\d+)', 'top_reactions'),
+        # Reactor count
+        (r'"reactor_count"\s*:\s*(\d+)', 'reactor_count'),
+        # Like count direct
+        (r'"like_count"\s*:\s*(\d+)', 'like_count_direct'),
+    ]
+    
+    likes_candidates = []
+    for pattern, name in likes_patterns:
+        for m in re.finditer(pattern, search_html):
+            val_str = m.group(1)
+            val = parse_vietnamese_number(val_str) if isinstance(val_str, str) else int(val_str)
+            if val > 0:
+                likes_candidates.append((val, name))
+    
+    if likes_candidates:
+        # Lấy giá trị HỢP LÝ NHẤT (không phải max, vì max có thể là page total)
+        # Ưu tiên: i18n_reaction_count > reaction_count_obj > top_reactions
+        priority_order = ['i18n_reaction_count', 'reaction_count_obj', 'top_reactions', 'reactor_count', 'like_count_direct']
+        for preferred in priority_order:
+            for val, name in likes_candidates:
+                if name == preferred and val < 1000000:  # Sanity check: < 1M
+                    result['likes'] = val
+                    debug_info['v810_likes_source'] = name
+                    debug_info['v810_likes_value'] = val
+                    break
+            if result['likes'] > 0:
+                break
+        
+        # Fallback: smallest non-zero value (often correct)
+        if result['likes'] == 0:
+            valid = [v for v, _ in likes_candidates if 0 < v < 1000000]
+            if valid:
+                result['likes'] = min(valid)
+                debug_info['v810_likes_source'] = 'min_valid'
+    
+    # === COMMENTS patterns ===
+    comments_patterns = [
+        # Comment count với total
+        (r'"comment_count"\s*:\s*\{[^}]*?"total_count"\s*:\s*(\d+)', 'comment_count_total'),
+        # Comment count direct
+        (r'"comment_count"\s*:\s*(\d+)', 'comment_count_direct'),
+        # Total comments
+        (r'"total_comment_count"\s*:\s*(\d+)', 'total_comment_count'),
+        # i18n comment count
+        (r'"i18n_comment_count"\s*:\s*"([\d,\.KkMmBb]+)"', 'i18n_comment_count'),
+    ]
+    
+    comments_candidates = []
+    for pattern, name in comments_patterns:
+        for m in re.finditer(pattern, search_html):
+            val_str = m.group(1)
+            val = parse_vietnamese_number(val_str) if not val_str.isdigit() else int(val_str)
+            if val > 0 and val < 1000000:  # Sanity check
+                comments_candidates.append((val, name))
+    
+    if comments_candidates:
+        priority_order = ['comment_count_total', 'i18n_comment_count', 'comment_count_direct', 'total_comment_count']
+        for preferred in priority_order:
+            for val, name in comments_candidates:
+                if name == preferred:
+                    result['comments'] = val
+                    debug_info['v810_comments_source'] = name
+                    debug_info['v810_comments_value'] = val
+                    break
+            if result['comments'] > 0:
+                break
+    
+    # === SHARES patterns ===
+    shares_patterns = [
+        # Share count với object wrapper
+        (r'"share_count"\s*:\s*\{[^}]*?"count"\s*:\s*(\d+)', 'share_count_obj'),
+        # Share count direct
+        (r'"share_count"\s*:\s*(\d+)', 'share_count_direct'),
+        # i18n share count
+        (r'"i18n_share_count"\s*:\s*"([\d,\.KkMmBb]+)"', 'i18n_share_count'),
+        # Reshare count
+        (r'"reshare_count"\s*:\s*(\d+)', 'reshare_count'),
+    ]
+    
+    shares_candidates = []
+    for pattern, name in shares_patterns:
+        for m in re.finditer(pattern, search_html):
+            val_str = m.group(1)
+            val = parse_vietnamese_number(val_str) if not val_str.isdigit() else int(val_str)
+            if 0 <= val < 1000000:  # Sanity check
+                shares_candidates.append((val, name))
+    
+    if shares_candidates:
+        priority_order = ['share_count_obj', 'i18n_share_count', 'share_count_direct', 'reshare_count']
+        for preferred in priority_order:
+            for val, name in shares_candidates:
+                if name == preferred:
+                    result['shares'] = val
+                    debug_info['v810_shares_source'] = name
+                    debug_info['v810_shares_value'] = val
+                    break
+            if result['shares'] > 0 or any(name == priority_order[0] for _, name in shares_candidates):
+                break
+    
+    debug_info['v810_likes_candidates'] = likes_candidates[:10]
+    debug_info['v810_comments_candidates'] = comments_candidates[:10]
+    debug_info['v810_shares_candidates'] = shares_candidates[:10]
+    
+    return result
 
 
 def simulate_human(page):
@@ -1656,6 +1821,25 @@ def try_desktop_with_cookies(browser, url, cookies, result):
         result['data']['post_id'] = extracted.get('post_id')
         result['data']['video_url'] = final_url
         
+        # === V8.10: Extract engagement từ HTML JSON (fix mobile login wall) ===
+        post_id_for_eng = extracted.get('post_id')
+        v810_engagement = extract_engagement_from_html(html, post_id_for_eng, result['debug'])
+        
+        # Chỉ overwrite nếu V8.10 tìm được giá trị > 0
+        # (ưu tiên data từ mobile mode nếu có, V8.10 là fallback)
+        if v810_engagement['likes'] > 0:
+            result['data']['likes'] = v810_engagement['likes']
+            logger.info(f'✅ V8.10 desktop likes: {v810_engagement["likes"]}')
+        if v810_engagement['comments'] > 0:
+            result['data']['comments'] = v810_engagement['comments']
+            logger.info(f'✅ V8.10 desktop comments: {v810_engagement["comments"]}')
+        if v810_engagement['shares'] > 0:
+            result['data']['shares'] = v810_engagement['shares']
+            logger.info(f'✅ V8.10 desktop shares: {v810_engagement["shares"]}')
+        
+        result['debug']['v810_desktop_engagement'] = v810_engagement
+        # === END V8.10 ===
+        
         context.close()
         return views
     except Exception as e:
@@ -1813,7 +1997,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.9-anti-503-data-quality',
+        'version': '8.10-engagement-from-html',
     })
 
 
@@ -1837,7 +2021,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.9-anti-503-data-quality',
+        'version': '8.10-engagement-from-html',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
