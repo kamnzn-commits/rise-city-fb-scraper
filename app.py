@@ -1,25 +1,28 @@
 """
-Rise City Facebook Scraper API - V8.8 🎩 SMART WINDOW MATCH
-BASE: V8.7
-PATCH MỚI V8.8 (FIX TRIỆT ĐỂ LIVE REPLAY VIEWS):
-  KEY INSIGHT từ V8.7 debug:
-  - "play_count" GẦN post_id = views thật UI hiển thị (đúng) ✓
-  - "play_count" XA post_id = peak live viewers (sai) ✗
-  - "video_view_count" = 3-second views (số nhỏ hơn UI)
-  - "play_count_reduced" = "432" → đây là số UI hiển thị ✓
+Rise City Facebook Scraper API - V8.9 🎩 ANTI-503 + DATA QUALITY
+BASE: V8.8
+PATCH MỚI V8.9 (FIX 503 + DETECT INCOMPLETE DATA):
+  CONCURRENCY:
+  - Tăng Semaphore từ 1 → 2 (cho phép 2 request song song)
+  - Tăng SCRAPE_LOCK_TIMEOUT từ 5s → 10s (đợi lâu hơn trước khi reject)
+  - Hỗ trợ X-Bypass-Lock header (skip semaphore cho retry)
   
-  V8.8 SMART WINDOW MATCH:
-  1. Tìm post_id position trong HTML
-  2. Lấy candidates trong window [post_id_pos, post_id_pos + 1500]
-  3. Ưu tiên: play_count_reduced > play_count > video_view_count
-  4. Fallback: nearby (< 50000 chars) với cùng priority
-  5. Last fallback: UI "lượt xem" gần nhất
-  
-  Reel thường giữ nguyên logic V8.5 (max play_count)
+  DATA QUALITY:
+  - Đánh giá data_quality: complete | partial | incomplete_*
+  - Detect "zero_engagement_with_views": views > 100 mà likes=0,
+    comments=0, shares=0 (bất thường)
+  - Detect "missing_thumbnail": thiếu URL ảnh
+  - Detect "zero_views": views = 0 (chưa load hoặc video private)
+  - Trả flag should_retry để frontend biết cần quét lại
+  - Trả can_bypass khi 503 (frontend dùng X-Bypass-Lock retry)
 
-EXPECTED:
-- Video Diệu Nguyễn live (25761): 432 views ✓ (UI confirm)
-- Video Trần Xuân Hậu reel: 6604, 2100, 6600... (giữ nguyên)
+LOGIC HOÀN CHỈNH V8.9:
+1. Request đến → check semaphore (max 2 concurrent)
+2. Nếu busy → 503 + can_bypass=true
+3. Frontend retry với X-Bypass-Lock=true → bỏ qua semaphore
+4. Sau khi scrape → đánh giá data_quality
+5. Nếu incomplete → trả should_retry=true
+6. Frontend tự động quét lại sau 30s
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -51,12 +54,13 @@ PROXY_USERNAME_BASE = os.getenv('PROXY_USERNAME_BASE', '')  # ufxgmuzq
 PROXY_PASSWORD = os.getenv('PROXY_PASSWORD', '')
 PROXY_ENABLED = bool(PROXY_HOST and PROXY_USERNAME_BASE and PROXY_PASSWORD)
 
-# === V8.4: CONCURRENCY LIMIT ===
-# Render starter plan có RAM 512MB-2GB. Chạy 2 Playwright cùng lúc dễ OOM.
-# Semaphore giới hạn max 1 request scrape cùng lúc.
-SCRAPE_SEMAPHORE = threading.Semaphore(1)
-SCRAPE_LOCK_TIMEOUT = 5  # Đợi tối đa 5s nếu có request khác đang chạy
-# === END V8.4 ===
+# === V8.9: CONCURRENCY LIMIT ENHANCED ===
+# V8.4 ban đầu Semaphore(1) - quá strict, gây 503 nhiều
+# V8.9 tăng lên Semaphore(2) cho phép 2 request song song
+# Render Starter plan có 2GB RAM đủ cho 2 Playwright cùng lúc
+SCRAPE_SEMAPHORE = threading.Semaphore(2)
+SCRAPE_LOCK_TIMEOUT = 10  # Tăng từ 5s lên 10s đợi semaphore
+# === END V8.9 ===
 
 
 def get_random_vn_proxy():
@@ -1809,7 +1813,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.8-smart-window-match',
+        'version': '8.9-anti-503-data-quality',
     })
 
 
@@ -1833,12 +1837,12 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.8-smart-window-match',
+        'version': '8.9-anti-503-data-quality',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
         'proxy_pool_size': 10 if PROXY_ENABLED else 0,
-        'concurrency_limit': 1,
+        'concurrency_limit': 2,
         'modes_count': 3,
     })
 
@@ -1846,7 +1850,9 @@ def health():
 @app.route('/scrape', methods=['POST'])
 def scrape_endpoint():
     """
-    V8.4: Always return JSON. Use semaphore. Catch all exceptions.
+    V8.9: Always return JSON. Use semaphore (2 concurrent).
+    Support X-Bypass-Lock header for retry requests.
+    Return data_quality assessment.
     """
     try:
         # Auth check
@@ -1861,18 +1867,25 @@ def scrape_endpoint():
         if not url:
             return jsonify({'error': 'Missing url', 'success': False}), 400
         
-        # V8.4: Concurrency limit
-        acquired = SCRAPE_SEMAPHORE.acquire(timeout=SCRAPE_LOCK_TIMEOUT)
-        if not acquired:
-            logger.warning(f'⚠️ Semaphore timeout, refusing request: {url}')
-            return jsonify({
-                'success': False,
-                'error': 'Server busy. Another scrape in progress. Retry in 60s.',
-                'retry_after': 60,
-            }), 503
+        # V8.9: Check bypass lock header (cho retry requests)
+        bypass_lock = request.headers.get('X-Bypass-Lock', '').lower() in ('true', '1', 'yes')
+        
+        # V8.9: Concurrency limit (semaphore = 2)
+        if not bypass_lock:
+            acquired = SCRAPE_SEMAPHORE.acquire(timeout=SCRAPE_LOCK_TIMEOUT)
+            if not acquired:
+                logger.warning(f'⚠️ Semaphore timeout, refusing request: {url}')
+                return jsonify({
+                    'success': False,
+                    'error': 'Server busy. 2 scrapes in progress. Retry in 30s.',
+                    'retry_after': 30,
+                    'can_bypass': True,  # Frontend có thể thử với X-Bypass-Lock
+                }), 503
+        else:
+            logger.info(f'🔓 V8.9: Bypass lock enabled for: {url}')
         
         try:
-            logger.info(f'🎩 V8.4 Scraping: {url}')
+            logger.info(f'🎩 V8.9 Scraping: {url} (bypass={bypass_lock})')
             start_time = time.time()
             result = scrape_with_playwright(url)
             elapsed = time.time() - start_time
@@ -1880,20 +1893,63 @@ def scrape_endpoint():
             # Add timing info
             if isinstance(result, dict):
                 result.setdefault('debug', {})['scrape_time_seconds'] = round(elapsed, 2)
+                
+                # V8.9: DATA QUALITY ASSESSMENT
+                # Kiểm tra data có hoàn chỉnh không
+                video_data = result.get('data', {})
+                views_v = video_data.get('views', 0)
+                likes_v = video_data.get('likes', 0)
+                comments_v = video_data.get('comments', 0)
+                shares_v = video_data.get('shares', 0)
+                thumbnail_v = video_data.get('thumbnail', '')
+                
+                quality_issues = []
+                
+                # Check 1: Views > 0 nhưng tất cả engagement = 0 (bất thường)
+                if views_v > 100 and likes_v == 0 and comments_v == 0 and shares_v == 0:
+                    quality_issues.append('zero_engagement_with_views')
+                
+                # Check 2: Không có thumbnail
+                if not thumbnail_v or len(thumbnail_v) < 20:
+                    quality_issues.append('missing_thumbnail')
+                
+                # Check 3: Views = 0 (có thể FB chưa update hoặc video private)
+                if views_v == 0:
+                    quality_issues.append('zero_views')
+                
+                # Đánh giá quality
+                if not quality_issues:
+                    data_quality = 'complete'
+                elif len(quality_issues) == 1 and 'missing_thumbnail' in quality_issues:
+                    data_quality = 'partial'  # Chỉ thiếu thumbnail (không quan trọng)
+                elif 'zero_views' in quality_issues:
+                    data_quality = 'incomplete_no_views'
+                elif 'zero_engagement_with_views' in quality_issues:
+                    data_quality = 'incomplete_no_engagement'
+                else:
+                    data_quality = 'partial'
+                
+                result['data_quality'] = data_quality
+                result['quality_issues'] = quality_issues
+                result['should_retry'] = data_quality.startswith('incomplete')
+                
+                logger.info(f'✅ V8.9 Done in {elapsed:.1f}s: {url}, quality={data_quality}')
             
-            logger.info(f'✅ V8.4 Done in {elapsed:.1f}s: {url}')
             return jsonify(result)
         finally:
-            # Force GC + release semaphore
+            # Force GC + release semaphore (chỉ release nếu đã acquire)
             gc.collect()
-            SCRAPE_SEMAPHORE.release()
+            if not bypass_lock:
+                SCRAPE_SEMAPHORE.release()
             
     except Exception as e:
-        # V8.4: NEVER return HTML 502, always JSON
-        logger.exception(f'❌ V8.4 Endpoint error: {e}')
+        # V8.9: NEVER return HTML 502, always JSON
+        logger.exception(f'❌ V8.9 Endpoint error: {e}')
         return jsonify({
             'success': False,
             'error': f'Internal server error: {type(e).__name__}: {str(e)}',
+            'data_quality': 'error',
+            'should_retry': True,
             'data': {
                 'views': 0, 'likes': 0, 'comments': 0, 'shares': 0,
                 'caption': '', 'thumbnail': '', 'username': '', 'post_id': None,
