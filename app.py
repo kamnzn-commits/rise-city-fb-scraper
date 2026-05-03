@@ -1,36 +1,47 @@
 """
-Rise City Facebook Scraper API - V8.11 🎩 ANTI-MULTI-POSTS + LIVE PROXY GUARD
-BASE: V8.10
-PATCH MỚI V8.11 (FIX 2 BUGS NGHIÊM TRỌNG):
+Rise City Facebook Scraper API - V8.12 🎩 URL-BASED LIVE DETECTION + SMART TRUNCATE
+BASE: V8.11 SMART TRUNCATE
+PATCH MỚI V8.12 (FIX VIEWS WRONG VỚI LIVE REPLAY KHI COOKIES EXPIRED):
 
-  BUG 1: Mobile mode parse cộng dồn engagement của nhiều posts
-  Case: Video Ngọc Nguyễn live, FB hiển thị feed có 3 posts
-    - Post target: 21 likes, 11 cmt, 0 shares
-    - Post 2: 8 likes, 4 cmt, 0 shares
-    - Post 3: 29 likes, 12 cmt, 1 shares
-    Tổng cộng nhầm: 94 likes (sai 4.5 lần)
+  ROOT CAUSE V8.11 OLD VẪN BUG:
+  - V8.11 detect live qua HTML markers (was_live_broadcast, etc.)
+  - Khi cookies expired → desktop bị login wall → HTML rỗng
+  - V8.11 không tìm thấy markers → cho rằng KHÔNG phải live
+  - Chạy proxy → proxy lấy peak viewers (61K) thay vì replay views (3.5K)
   
-  FIX V8.11:
-    - Count icon LIKE trong target_text (sau isolation)
-    - Nếu > 2 icon LIKE → có nhiều posts → SKIP mobile engagement
-    - Trả 0 (an toàn) thay vì cộng dồn sai
-
-  BUG 2: Proxy fallback lấy peak concurrent viewers cho live replay
-  Case: Video Ngọc Nguyễn live actual=3,500 → proxy trả 61,704 (peak live)
+  FIX V8.12 (URL-BASED DETECTION):
+  Detect live replay từ MULTIPLE URL signals (không cần HTML):
+    1. URL pattern '/share/v/' (FB share link cho live)
+    2. final_url chứa '/share/v/' sau redirect
+    3. final_url chứa 'story.php' hoặc 'story_fbid=' (legacy live format)
+    4. final_url chứa '/login/?next=' (cookies expired = thường live private)
+    5. URL có 'live_video_id=' parameter
+    6. mobile_innertext có "phát trực tiếp" (Vietnamese)
+    7. HTML markers (V8.11 logic, vẫn giữ làm fallback)
+    8. format_detected = 'video_live'
   
-  FIX V8.11:
-    - Detect live replay markers TRƯỚC khi gọi proxy
-    - Markers: was_live_broadcast, broadcast_status VOD_READY,
-      is_live_streaming, live_video_id, format_detected=video_live, /share/v/
-    - Nếu là live replay → SKIP proxy (avoid wrong views)
-    - Skip lý do: 'v811_live_replay_skip_proxy'
+  Detection rule: ≥ 1 signal → SKIP proxy
+  Conservative: prefer false positive (skip nhầm) hơn để proxy lấy số sai
 
-LOGIC HOÀN CHỈNH V8.11:
+  ENGAGEMENT (giữ V8.11 SMART TRUNCATE):
+  - Find tất cả icon LIKE positions
+  - Nếu có ≥ 2 positions → có nhiều posts → cắt trước icon #2
+  - Lùi tới newline gần nhất → giữ post target nguyên vẹn
+  - Parse engagement chỉ trong post đầu (target)
+
+LOGIC HOÀN CHỈNH V8.12:
 1. Desktop mode → views + V8.10 engagement
-2. Mobile mode → backup engagement (V8.11 guard chống multi-posts)
+2. Mobile mode → V8.11 SMART TRUNCATE first post
 3. /videos/ URL fallback → views + smart match
 4. Reel Grid → views fallback
-5. VN Proxy → CHỈ cho non-live videos (V8.11)
+5. VN Proxy → CHỈ cho non-live videos (V8.12 URL detection)
+
+EXPECTED CHO NGỌC NGUYỄN VIDEO:
+- views = 0 (skip proxy đúng)
+- likes = 21 (V8.11 smart truncate)
+- comments = 11
+- shares = 2 (UI=0, edge case)
+- v812_live_signals = ['url_share_v', 'redirect_share_v', 'login_redirect']
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -248,33 +259,50 @@ def parse_mobile_engagement(innertext, debug_info):
     debug_info['isolation_marker'] = matched_marker
     debug_info['isolation_length'] = len(target_text)
     
-    # === V8.11: GUARD AGAINST MULTI-POSTS FEED ===
+    # === V8.11: SMART TRUNCATE TO FIRST POST (anti multi-posts) ===
     # Bug case (Ngọc Nguyễn live): isolation không cắt được → target_text có
     # nhiều posts → cộng dồn engagement → SAI hoàn toàn.
-    # Nếu target_text > 1500 chars VÀ chứa nhiều icon LIKE/CMT → có nhiều posts.
+    # 
+    # FIX V8.11: Cắt target_text trước icon LIKE thứ 2 → chỉ lấy post đầu tiên.
+    # Logic: Mỗi post FB có 1 icon LIKE. Post đầu = target. Cắt trước icon LIKE #2.
     
-    # Count icon sets trong target_text
     REEL_LIKE_CHECK  = '\U000F0378'
     VID_LIKE_CHECK   = '\U000F0925'
-    likes_icon_count = target_text.count(REEL_LIKE_CHECK) + target_text.count(VID_LIKE_CHECK)
     
-    debug_info['v811_target_length'] = len(target_text)
-    debug_info['v811_likes_icon_count'] = likes_icon_count
+    # Tìm tất cả vị trí icon LIKE
+    like_positions = []
+    for i, ch in enumerate(target_text):
+        if ch == REEL_LIKE_CHECK or ch == VID_LIKE_CHECK:
+            like_positions.append(i)
     
-    # Nếu target có > 2 icon LIKE → likely là feed với nhiều posts → skip
-    if likes_icon_count > 2:
-        debug_info['v811_skip_reason'] = 'multi_posts_detected'
-        debug_info['v83_engagement'] = {'likes': 0, 'comments': 0, 'shares': 0}
-        logger.warning(f'⚠️ V8.11: Detected {likes_icon_count} posts in feed, skipping mobile engagement')
-        return data  # Return zero engagement - safer than wrong values
+    debug_info['v811_target_length_before'] = len(target_text)
+    debug_info['v811_like_positions_count'] = len(like_positions)
     
-    # Nếu target_text quá dài VÀ không có Reel marker rõ ràng → skip
-    if len(target_text) > 1800 and likes_icon_count > 1:
-        debug_info['v811_skip_reason'] = 'target_too_long'
-        debug_info['v83_engagement'] = {'likes': 0, 'comments': 0, 'shares': 0}
-        logger.warning(f'⚠️ V8.11: Target text {len(target_text)} chars too long, skipping')
-        return data
-    # === END V8.11 GUARD ===
+    # Nếu có ≥ 2 icon LIKE → có nhiều posts → cắt trước icon LIKE #2
+    if len(like_positions) >= 2:
+        # Tìm điểm cắt: lùi lại 1 chút trước icon LIKE #2
+        # để không cắt giữa số (vd: "21\n[CUT]\n8 likes của post 2")
+        # Lùi đến newline gần nhất TRƯỚC icon thứ 2
+        second_like_pos = like_positions[1]
+        
+        # Lùi tới newline gần nhất trước position đó
+        truncate_pos = second_like_pos
+        for back_i in range(second_like_pos - 1, max(0, second_like_pos - 200), -1):
+            if target_text[back_i] == '\n':
+                truncate_pos = back_i
+                break
+        
+        target_text_truncated = target_text[:truncate_pos]
+        lines = target_text_truncated.split('\n')
+        target_text = target_text_truncated
+        
+        debug_info['v811_truncated'] = True
+        debug_info['v811_truncate_pos'] = truncate_pos
+        debug_info['v811_target_length_after'] = len(target_text)
+        logger.info(f'🎯 V8.11: Truncated to first post ({len(target_text)} chars, {len(like_positions)} posts detected)')
+    else:
+        debug_info['v811_truncated'] = False
+    # === END V8.11 SMART TRUNCATE ===
     
     # Step 2: Detect icon set
     REEL_LIKE  = '\U000F0378'
@@ -1738,17 +1766,23 @@ def scrape_with_playwright(url):
                             continue
             # === END V8.5 /videos/ URL FALLBACK ===
             
-            # === V8.11 SMART ROUTING: Skip proxy cho live replay (avoid wrong views) ===
-            # Bug case (Ngọc Nguyễn live): proxy lấy peak concurrent viewers (61K)
-            # thay vì replay views (3.5K). Nếu là live replay → KHÔNG dùng proxy.
+            # === V8.12 SMART ROUTING: URL-based live replay detection ===
+            # Bug case (Ngọc Nguyễn): cookies expired → redirect login → HTML=0 →
+            # V8.11 không detect live → chạy proxy → views=61K SAI.
+            # 
+            # FIX V8.12: Detect live replay từ URL patterns (không cần HTML).
+            # Ngay cả khi cookies expired, URL vẫn có signals đủ.
             result['debug']['proxy_used'] = False
             result['debug']['proxy_views'] = 0
             
-            # V8.11: Detect live replay markers
-            is_live_replay_v811 = False
+            # V8.12: Multi-source live replay detection
+            is_live_replay_v812 = False
+            v812_live_signals = []
+            
             try:
+                # Check 1: HTML markers (V8.11 logic, vẫn giữ)
                 if html and len(html) > 1000:
-                    live_markers_v811 = [
+                    live_markers_v812 = [
                         '"was_live_broadcast":true',
                         '"broadcast_status":"VOD_READY"',
                         '"broadcast_status":"LIVE_STOPPED"',
@@ -1756,24 +1790,57 @@ def scrape_with_playwright(url):
                         '"live_video_id"',
                         '"liveBroadcastId"',
                     ]
-                    is_live_replay_v811 = any(m in html for m in live_markers_v811)
+                    for m in live_markers_v812:
+                        if m in html:
+                            v812_live_signals.append(f'html:{m[:30]}')
                 
-                # Fallback: detect via final_url
-                if not is_live_replay_v811:
-                    final_url_check = result.get('debug', {}).get('iphone15_url_after_redirect', '')
-                    if '/share/v/' in final_url_check or '/share/v/' in url:
-                        is_live_replay_v811 = True
-                
-                # Fallback: detect via format_detected
+                # Check 2: format_detected từ debug
                 if result.get('debug', {}).get('format_detected') == 'video_live':
-                    is_live_replay_v811 = True
-            except:
-                pass
+                    v812_live_signals.append('format_video_live')
+                
+                # === V8.12 NEW: URL-BASED DETECTION ===
+                # Khi cookies expired, HTML rỗng → check URL patterns
+                
+                final_url_check = result.get('debug', {}).get('iphone15_url_after_redirect', '') or ''
+                
+                # Signal 1: /share/v/ URL pattern (FB share link cho video live)
+                if '/share/v/' in url:
+                    v812_live_signals.append('url_share_v')
+                if '/share/v/' in final_url_check:
+                    v812_live_signals.append('redirect_share_v')
+                
+                # Signal 2: story.php?story_fbid= (legacy live post format)
+                if 'story_fbid=' in final_url_check or 'story.php' in final_url_check:
+                    v812_live_signals.append('legacy_story_php')
+                
+                # Signal 3: Login redirect (cookies expired = thường là live private)
+                if '/login/?next=' in final_url_check or '/login.php' in final_url_check:
+                    v812_live_signals.append('login_redirect')
+                
+                # Signal 4: live_video_id trong URL params
+                if 'live_video_id=' in url or 'live_video_id=' in final_url_check:
+                    v812_live_signals.append('url_live_video_id')
+                
+                # Signal 5: Mobile innertext có "phát trực tiếp" (FB Live in Vietnamese)
+                mobile_innertext_check = result.get('debug', {}).get('mobile_innertext_sample', '') or ''
+                live_keywords_vi = ['đã phát trực tiếp', 'phát trực tiếp', 'broadcast was live', 'is live now']
+                for kw in live_keywords_vi:
+                    if kw in mobile_innertext_check:
+                        v812_live_signals.append(f'mobile_kw:{kw[:20]}')
+                        break
+                
+                # Detection rule: ≥ 1 signal → likely live replay
+                # (Conservative: prefer false positive vs let proxy lấy số sai)
+                is_live_replay_v812 = len(v812_live_signals) >= 1
+                
+            except Exception as e:
+                logger.warning(f'V8.12 live detection error: {e}')
             
-            result['debug']['v811_is_live_replay_global'] = is_live_replay_v811
+            result['debug']['v812_is_live_replay'] = is_live_replay_v812
+            result['debug']['v812_live_signals'] = v812_live_signals
             
-            if (result['data']['views'] == 0 and PROXY_ENABLED and not is_live_replay_v811):
-                logger.info('🎩 Views=0, retry với VN residential proxy...')
+            if (result['data']['views'] == 0 and PROXY_ENABLED and not is_live_replay_v812):
+                logger.info('🎩 Views=0, retry với VN residential proxy (not live)...')
                 proxy_views = try_vn_proxy_for_views(p, url, cookies, result)
                 result['debug']['proxy_used'] = True
                 result['debug']['proxy_views'] = proxy_views
@@ -1781,15 +1848,15 @@ def scrape_with_playwright(url):
                 if proxy_views > 0:
                     result['data']['views'] = proxy_views
                     logger.info(f'✅ VN Proxy fix views=0! Got {proxy_views} views')
-            elif is_live_replay_v811 and result['data']['views'] == 0:
-                logger.warning('⚠️ V8.11: SKIP proxy cho live replay (avoid peak viewer bug)')
-                result['debug']['proxy_skipped_reason'] = 'v811_live_replay_skip_proxy'
+            elif is_live_replay_v812 and result['data']['views'] == 0:
+                logger.warning(f'⚠️ V8.12: SKIP proxy cho live replay. Signals: {v812_live_signals}')
+                result['debug']['proxy_skipped_reason'] = 'v812_live_replay_skip_proxy'
             elif result['data']['views'] == 0 and not PROXY_ENABLED:
                 result['debug']['proxy_used'] = False
                 result['debug']['proxy_note'] = 'Views=0 but proxy not configured'
             else:
                 result['debug']['proxy_skipped_reason'] = 'views_already_found'
-            # === END V8.11 SMART ROUTING ===
+            # === END V8.12 SMART ROUTING ===
             
             browser.close()
             
@@ -2061,7 +2128,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.11-anti-multi-posts',
+        'version': '8.12-url-live-detection',
     })
 
 
@@ -2085,7 +2152,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.11-anti-multi-posts',
+        'version': '8.12-url-live-detection',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
