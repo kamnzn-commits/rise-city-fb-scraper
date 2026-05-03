@@ -1,40 +1,48 @@
 """
-Rise City Facebook Scraper API - V8.13 🎩 EXTRACT VIEWS FOR LIVE /share/v/
-BASE: V8.12.1 (MULTI-SOURCE URL DETECTION)
-PATCH MỚI V8.13 (FIX VIEWS = 0 CHO LIVE REPLAY EDGE CASE):
+Rise City Facebook Scraper API - V8.14 🎩 URL INPUT LIVE DETECTION (TRIỆT ĐỂ)
+BASE: V8.13 (EXTRACT VIEWS FOR LIVE)
+PATCH MỚI V8.14 (FIX TRIỆT ĐỂ DETECTION):
 
-  CONTEXT:
-  - V8.12.1 đã skip proxy đúng cho live replay (tránh peak 61K SAI)
-  - Nhưng để lại views = 0 (UI thực tế = 3,600)
-  - User nhập tay không tiện cho 50+ video
+  ROOT CAUSE TẤT CẢ V8.11 → V8.13 BUGS:
+  - Detect live qua HTML/cookies/redirect → KHÔNG RELIABLE
+  - Khi cookies expired → desktop login wall → HTML rỗng
+  - V8.12 detection chỉ đọc field debug có sau khi mode chạy
+  - → signals trống → proxy chạy → views = 61K SAI
 
-  ROOT CAUSE VIEWS = 0:
-  - Mobile innertext FB không trả views cho /share/v/ live (chỉ likes/cmts/shares)
-  - iphone15 mode lấy được HTML 44KB nhưng search_views_in_text không match
-  - HTML có pattern "3,6K" hoặc "3.6K" UI nhưng không có "lượt xem" keyword
+  FIX V8.14 (URL INPUT CHECK):
+  - Function is_live_replay_url_v814(url) check ngay đầu hàm scrape
+  - Patterns:
+    * '/share/v/' = SHARE VIDEO LINK (live replay, 100% accurate)
+    * '/live/'    = DIRECT LIVE URL
+    * 'live_video_id=' = URL parameter
+  - Negative patterns (rule out reels):
+    * '/share/r/' = SHARE REEL (NOT live)
+    * '/reel/'    = Direct reel (NOT live)
+  - Logic: nếu match POSITIVE và KHÔNG match NEGATIVE → là live
+  - Set flag is_live_replay_input ngay từ đầu
+  - SKIP proxy nếu flag = True
 
-  FIX V8.13 (extract_views_for_share_v_live):
-  - Search "X,XK" hoặc "X.XK" pattern trong HTML iphone15 (44KB)
-  - Search FB JSON patterns: viewer_count, watching_count, unique_viewers
-  - Search Vietnamese number trước "lượt xem"
-  - Lấy median value (robust hơn min/max)
-  - Sanity check: 1000 ≤ views ≤ 100K (live videos thường có range này)
-  - Lưu iphone15_html_content trong debug (chỉ cho /share/v/, tránh bloat)
-  - Chỉ kích hoạt khi V8.12.1 detect là live replay
+  COMBINED LOGIC:
+  - is_live_replay_final = is_live_replay_input OR is_live_replay_v812
+  - Cả 2 phải False mới chạy proxy
+  - V8.14 input check là PRIMARY (reliable)
+  - V8.12 HTML check là FALLBACK
 
-  EXPECTED CHO NGỌC NGUYỄN VIDEO (V8.13):
-  - views: 3,600 (parse "3,6K" từ HTML) ✅
-  - likes: 21 (V8.11 smart truncate vẫn work)
-  - comments: 11
-  - shares: 2
+  EXPECTED CHO NGỌC NGUYỄN VIDEO (V8.14):
+  - v814_is_live_replay_input: true ✅
+  - v814_final_decision: true ✅
+  - proxy_used: false ✅ (KHÔNG còn 61K SAI)
+  - views: 0 hoặc 3,600 (nếu V8.13 extract được)
+  - likes: 21, comments: 11, shares: 2
 
-LOGIC HOÀN CHỈNH V8.13:
-1. Desktop mode → views + V8.10 engagement
-2. Mobile mode → V8.11 SMART TRUNCATE first post engagement
-3. /videos/ URL fallback → views + smart match
-4. Reel Grid → views fallback
-5. VN Proxy → CHỈ cho non-live videos (V8.12.1 multi-source detection)
-6. V8.13 NEW: Live replay → extract views từ iphone15 HTML pattern
+LOGIC HOÀN CHỈNH V8.14:
+1. URL input check (V8.14) → set live flag
+2. Desktop mode → views + V8.10 engagement
+3. Mobile mode → V8.11 SMART TRUNCATE first post
+4. /videos/ URL fallback → views + smart match
+5. Reel Grid → views fallback
+6. VN Proxy → CHỈ cho non-live videos (V8.14 + V8.12.1 combined)
+7. V8.13 NEW: Live replay → extract views từ iphone15 HTML pattern
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -162,6 +170,59 @@ def parse_netscape_cookies(cookies_path):
                 'httpOnly': False, 'sameSite': 'Lax',
             })
     return cookies
+
+
+# ==========================================
+# V8.14: SIMPLE LIVE REPLAY URL DETECTION
+# Check URL input ĐẦU TIÊN, trước mọi xử lý
+# Không phụ thuộc HTML/cookies/redirect → 100% reliable
+# ==========================================
+
+def is_live_replay_url_v814(url):
+    """
+    V8.14: Detect live replay video từ URL pattern.
+    
+    Live replay URL formats:
+    - https://www.facebook.com/share/v/XXXXX/        ← Share video link
+    - https://www.facebook.com/USER/live/XXXXX/      ← Direct live
+    - https://www.facebook.com/...?live_video_id=XX  ← With param
+    
+    NON-live (reel) formats:
+    - https://www.facebook.com/reel/XXXXX            ← Reel
+    - https://www.facebook.com/share/r/XXXXX         ← Share reel (note /r/ not /v/)
+    - https://www.facebook.com/USER/videos/XXXXX     ← Regular video
+    
+    Returns: True nếu là live replay
+    """
+    if not url:
+        return False
+    
+    url_lower = url.lower()
+    
+    # Check positive signals
+    live_patterns = [
+        '/share/v/',          # Share video URL (FB live share format)
+        '/live/',             # Direct live URL
+        'live_video_id=',     # Live video param
+    ]
+    
+    # Negative patterns (rule out)
+    non_live_patterns = [
+        '/share/r/',          # Share reel (NOT live)
+        '/reel/',             # Reel format
+    ]
+    
+    # Nếu có pattern non-live → KHÔNG phải live (priority)
+    for pat in non_live_patterns:
+        if pat in url_lower:
+            return False
+    
+    # Nếu có pattern live → là live
+    for pat in live_patterns:
+        if pat in url_lower:
+            return True
+    
+    return False
 
 
 def parse_vietnamese_number(text):
@@ -1508,6 +1569,10 @@ def scrape_with_playwright(url):
     if not cookies:
         return {'success': False, 'error': 'No cookies loaded'}
     
+    # === V8.14: DETECT LIVE REPLAY ĐẦU TIÊN ===
+    # Check URL input pattern, không phụ thuộc HTML/cookies
+    is_live_replay_input = is_live_replay_url_v814(url)
+    
     result = {
         'success': False,
         'data': {
@@ -1522,8 +1587,13 @@ def scrape_with_playwright(url):
             'mode_used': '',
             'tried_modes': [],
             'view_sources': {},
+            'v814_is_live_replay_input': is_live_replay_input,  # V8.14 flag
+            'v814_url_input': url,
         }
     }
+    
+    if is_live_replay_input:
+        logger.info(f'🎯 V8.14: Detected LIVE REPLAY from URL pattern: {url}')
     
     try:
         with sync_playwright() as p:
@@ -1961,7 +2031,15 @@ def scrape_with_playwright(url):
             result['debug']['v812_is_live_replay'] = is_live_replay_v812
             result['debug']['v812_live_signals'] = v812_live_signals
             
-            if (result['data']['views'] == 0 and PROXY_ENABLED and not is_live_replay_v812):
+            # === V8.14: COMBINE ALL SIGNALS ===
+            # V8.14 input check (URL pattern) → 100% reliable
+            # V8.12 HTML/redirect check → fallback
+            # NẾU ANY of them = True → là live replay
+            is_live_replay_final = is_live_replay_input or is_live_replay_v812
+            result['debug']['v814_final_decision'] = is_live_replay_final
+            result['debug']['v814_input_check'] = is_live_replay_input
+            
+            if (result['data']['views'] == 0 and PROXY_ENABLED and not is_live_replay_final):
                 logger.info('🎩 Views=0, retry với VN residential proxy (not live)...')
                 proxy_views = try_vn_proxy_for_views(p, url, cookies, result)
                 result['debug']['proxy_used'] = True
@@ -1970,14 +2048,18 @@ def scrape_with_playwright(url):
                 if proxy_views > 0:
                     result['data']['views'] = proxy_views
                     logger.info(f'✅ VN Proxy fix views=0! Got {proxy_views} views')
-            elif is_live_replay_v812 and result['data']['views'] == 0:
-                logger.warning(f'⚠️ V8.12: SKIP proxy cho live replay. Signals: {v812_live_signals}')
-                result['debug']['proxy_skipped_reason'] = 'v812_live_replay_skip_proxy'
+            elif is_live_replay_final and result['data']['views'] == 0:
+                # V8.14: SKIP proxy cho live replay
+                if is_live_replay_input:
+                    logger.warning(f'⚠️ V8.14: SKIP proxy cho live replay (URL input pattern)')
+                    result['debug']['proxy_skipped_reason'] = 'v814_live_replay_url_pattern'
+                else:
+                    logger.warning(f'⚠️ V8.12: SKIP proxy cho live replay. Signals: {v812_live_signals}')
+                    result['debug']['proxy_skipped_reason'] = 'v812_live_replay_skip_proxy'
                 
-                # === V8.13: Try extract views from iphone15 HTML + mobile innertext ===
-                logger.info('🎩 V8.13: Try extract views for /share/v/ live...')
+                # V8.13: Try extract views (giữ nguyên cho live videos)
+                logger.info('🎩 V8.13: Try extract views for live replay...')
                 
-                # Lấy HTML từ iphone15 mode (thường có 44KB)
                 iphone15_html = result.get('debug', {}).get('iphone15_html_content', '') or html or ''
                 mobile_text_for_views = result.get('debug', {}).get('mobile_innertext_sample', '') or ''
                 
@@ -1991,14 +2073,14 @@ def scrape_with_playwright(url):
                     result['data']['views'] = v813_views
                     logger.info(f'✅ V8.13 found views for live: {v813_views}')
                 else:
-                    logger.info('⚠️ V8.13: No views found, return 0')
+                    logger.info('⚠️ V8.13: No views found, return 0 (better than wrong)')
                 # === END V8.13 ===
             elif result['data']['views'] == 0 and not PROXY_ENABLED:
                 result['debug']['proxy_used'] = False
                 result['debug']['proxy_note'] = 'Views=0 but proxy not configured'
             else:
                 result['debug']['proxy_skipped_reason'] = 'views_already_found'
-            # === END V8.12 SMART ROUTING ===
+            # === END V8.14 SMART ROUTING ===
             
             browser.close()
             
@@ -2270,7 +2352,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.13-extract-views-share-v',
+        'version': '8.14-url-input-detection',
     })
 
 
@@ -2294,7 +2376,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.13-extract-views-share-v',
+        'version': '8.14-url-input-detection',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
