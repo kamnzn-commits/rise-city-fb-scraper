@@ -1,39 +1,40 @@
 """
-Rise City Facebook Scraper API - V8.12.1 🎩 MULTI-SOURCE URL DETECTION
-BASE: V8.12 (URL-BASED LIVE DETECTION)
-PATCH MỚI V8.12.1 (FIX V8.12 DETECTION BUG):
+Rise City Facebook Scraper API - V8.13 🎩 EXTRACT VIEWS FOR LIVE /share/v/
+BASE: V8.12.1 (MULTI-SOURCE URL DETECTION)
+PATCH MỚI V8.13 (FIX VIEWS = 0 CHO LIVE REPLAY EDGE CASE):
 
-  ROOT CAUSE V8.12:
-  - V8.12 chỉ đọc 'iphone15_url_after_redirect' từ debug
-  - Field này CHỈ có sau khi iphone15 mode chạy
-  - Khi detection chạy TRƯỚC iphone15 → field empty
-  - → v812_live_signals = [] → chạy proxy → views=61K SAI
+  CONTEXT:
+  - V8.12.1 đã skip proxy đúng cho live replay (tránh peak 61K SAI)
+  - Nhưng để lại views = 0 (UI thực tế = 3,600)
+  - User nhập tay không tiện cho 50+ video
 
-  FIX V8.12.1 (MULTI-SOURCE READ):
-  - Đọc final_url từ ROOT level (luôn có)
-  - Đọc iphone15_url_after_redirect làm fallback
-  - Combine cả 3 nguồn: url + final_url_root + final_url_iphone
-  - Thêm Signal 6: error == "Redirected to login"
-  - Loosen 'login_redirect' check: cũng match 'facebook.com/login'
+  ROOT CAUSE VIEWS = 0:
+  - Mobile innertext FB không trả views cho /share/v/ live (chỉ likes/cmts/shares)
+  - iphone15 mode lấy được HTML 44KB nhưng search_views_in_text không match
+  - HTML có pattern "3,6K" hoặc "3.6K" UI nhưng không có "lượt xem" keyword
 
-  EXPOSED MỚI:
-  - v812_final_url_root (debug)
-  - v812_final_url_iphone (debug)
-  - signal 'error_redirect_login' (mới)
+  FIX V8.13 (extract_views_for_share_v_live):
+  - Search "X,XK" hoặc "X.XK" pattern trong HTML iphone15 (44KB)
+  - Search FB JSON patterns: viewer_count, watching_count, unique_viewers
+  - Search Vietnamese number trước "lượt xem"
+  - Lấy median value (robust hơn min/max)
+  - Sanity check: 1000 ≤ views ≤ 100K (live videos thường có range này)
+  - Lưu iphone15_html_content trong debug (chỉ cho /share/v/, tránh bloat)
+  - Chỉ kích hoạt khi V8.12.1 detect là live replay
 
-  EXPECTED CHO NGỌC NGUYỄN VIDEO (V8.12.1):
-  - v812_is_live_replay: true ✅
-  - v812_live_signals: 5 signals
-  - proxy_used: false (skip đúng) ✅
-  - views: 0 (KHÔNG còn 61K SAI) ✅
-  - likes: 21, comments: 11, shares: 2 (smart truncate vẫn work)
+  EXPECTED CHO NGỌC NGUYỄN VIDEO (V8.13):
+  - views: 3,600 (parse "3,6K" từ HTML) ✅
+  - likes: 21 (V8.11 smart truncate vẫn work)
+  - comments: 11
+  - shares: 2
 
-LOGIC HOÀN CHỈNH V8.12.1:
+LOGIC HOÀN CHỈNH V8.13:
 1. Desktop mode → views + V8.10 engagement
-2. Mobile mode → V8.11 SMART TRUNCATE first post
+2. Mobile mode → V8.11 SMART TRUNCATE first post engagement
 3. /videos/ URL fallback → views + smart match
-4. Reel Grid → views fallback  
+4. Reel Grid → views fallback
 5. VN Proxy → CHỈ cho non-live videos (V8.12.1 multi-source detection)
+6. V8.13 NEW: Live replay → extract views từ iphone15 HTML pattern
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -579,6 +580,115 @@ def extract_engagement_from_html(html, post_id=None, debug_info=None):
     return result
 
 
+# ==========================================
+# V8.13: EXTRACT VIEWS FOR /share/v/ LIVE VIDEOS
+# Khi cookies expired + login wall → mobile innertext không có views
+# Nhưng iphone15 mode load được HTML 44KB → có thể parse "3,6K" pattern
+# ==========================================
+
+def extract_views_for_share_v_live(html, mobile_innertext, debug_info=None):
+    """
+    V8.13: Extract views cho video /share/v/ live khi mobile innertext không có.
+    
+    Strategy:
+    1. Search "X,XK" hoặc "X.XK" pattern trong HTML (vd "3,6K")
+    2. Search Vietnamese number patterns
+    3. Search FB JSON patterns
+    4. Sanity check: 100 ≤ views ≤ 10M
+    
+    Returns: int views, hoặc 0 nếu không tìm được
+    """
+    if debug_info is None:
+        debug_info = {}
+    
+    candidates = []
+    
+    # === Pattern 1: K notation (3,6K, 3.6K, 1,2K) ===
+    # FB hiển thị views dưới dạng "3,6K" hoặc "3.6K" (số nhỏ hơn 10K)
+    # Hoặc "12K" cho số tròn nghìn
+    k_patterns = [
+        r'(\d+[,.]\d+)\s*K',           # "3,6K" hoặc "3.6K"
+        r'(\d+)\s*K',                  # "12K"
+        r'(\d+[,.]\d+)\s*nghìn',       # "3,6 nghìn"
+        r'(\d+)\s*nghìn',              # "3 nghìn"
+    ]
+    
+    if html:
+        for pat in k_patterns:
+            matches = re.findall(pat, html[:100000])  # Limit để tránh slow
+            for m in matches[:50]:
+                # Convert "3,6" → 3.6, "3.6" → 3.6
+                num_str = m.replace(',', '.')
+                try:
+                    num = float(num_str)
+                    val = int(num * 1000)  # Convert K → actual number
+                    if 100 <= val <= 10000000:  # Sanity: 100 - 10M
+                        candidates.append(('k_notation', val, m))
+                except:
+                    pass
+    
+    # === Pattern 2: Direct number patterns trong HTML ===
+    if html:
+        # Search "lượt xem" với encoded form
+        lxem_patterns = [
+            r'(\d{1,3}(?:[,.]\d{3})*)\s*l\u01b0\u1ee3t\s*xem',
+            r'"viewer_count"\s*:\s*(\d+)',
+            r'"viewerCount"\s*:\s*(\d+)',
+            r'"watching_count"\s*:\s*(\d+)',  # FB live "đang xem"
+            r'"unique_viewers"\s*:\s*(\d+)',
+        ]
+        for pat in lxem_patterns:
+            matches = re.findall(pat, html[:100000])
+            for m in matches[:30]:
+                try:
+                    val = int(m.replace(',', '').replace('.', ''))
+                    if 100 <= val <= 10000000:
+                        candidates.append(('lxem_pattern', val, m))
+                except:
+                    pass
+    
+    # === Pattern 3: Mobile innertext (nếu có 1 chút) ===
+    if mobile_innertext:
+        # Search number followed by 'K' icon hoặc 'lượt xem'
+        for pat in [r'(\d+[,.]\d+)\s*K', r'(\d+)\s*K']:
+            matches = re.findall(pat, mobile_innertext)
+            for m in matches[:20]:
+                try:
+                    num = float(m.replace(',', '.'))
+                    val = int(num * 1000)
+                    if 100 <= val <= 10000000:
+                        candidates.append(('mobile_k', val, m))
+                except:
+                    pass
+    
+    debug_info['v813_view_candidates'] = candidates[:20]
+    debug_info['v813_total_candidates'] = len(candidates)
+    
+    if not candidates:
+        debug_info['v813_views'] = 0
+        debug_info['v813_source'] = 'none'
+        return 0
+    
+    # Strategy: lấy GIÁ TRỊ NHỎ NHẤT trong range hợp lý
+    # Lý do: FB UI thường hiện số NHỎ HƠN tổng peak (peak là số sai cho live)
+    valid_values = [v for _, v, _ in candidates if 1000 <= v <= 100000]
+    
+    if valid_values:
+        # Lấy median thay vì min/max để robust hơn
+        valid_values.sort()
+        median_val = valid_values[len(valid_values) // 2]
+        debug_info['v813_views'] = median_val
+        debug_info['v813_source'] = 'median'
+        debug_info['v813_valid_values'] = valid_values[:10]
+        return median_val
+    
+    # Fallback: smallest in candidates
+    smallest = min((v for _, v, _ in candidates), default=0)
+    debug_info['v813_views'] = smallest
+    debug_info['v813_source'] = 'min_fallback'
+    return smallest
+
+
 def simulate_human(page):
     try:
         for _ in range(2):
@@ -769,6 +879,12 @@ def try_anonymous_with_fingerprint(browser, url, fingerprint, name, debug_info):
         debug_info[f'{name}_innertext_preview'] = innertext[:300]
         debug_info[f'{name}_network_count'] = len(captured_responses)
         debug_info[f'{name}_url_after_redirect'] = page.url
+        
+        # V8.13: Save html content for /share/v/ live extraction
+        # Only save if URL is /share/v/ to avoid bloating debug for other videos
+        if name == 'iphone15' and ('/share/v/' in url or '/share/v/' in page.url):
+            # Lưu first 100KB để V8.13 extract views
+            debug_info[f'{name}_html_content'] = html[:100000]
         
         # Check if redirected to login
         if 'login' in page.url.lower() or '\u0110\u0103ng nh\u1eadp v\u00e0o Facebook' in innertext[:200]:
@@ -1857,6 +1973,26 @@ def scrape_with_playwright(url):
             elif is_live_replay_v812 and result['data']['views'] == 0:
                 logger.warning(f'⚠️ V8.12: SKIP proxy cho live replay. Signals: {v812_live_signals}')
                 result['debug']['proxy_skipped_reason'] = 'v812_live_replay_skip_proxy'
+                
+                # === V8.13: Try extract views from iphone15 HTML + mobile innertext ===
+                logger.info('🎩 V8.13: Try extract views for /share/v/ live...')
+                
+                # Lấy HTML từ iphone15 mode (thường có 44KB)
+                iphone15_html = result.get('debug', {}).get('iphone15_html_content', '') or html or ''
+                mobile_text_for_views = result.get('debug', {}).get('mobile_innertext_sample', '') or ''
+                
+                v813_views = extract_views_for_share_v_live(
+                    iphone15_html, 
+                    mobile_text_for_views, 
+                    result['debug']
+                )
+                
+                if v813_views > 0:
+                    result['data']['views'] = v813_views
+                    logger.info(f'✅ V8.13 found views for live: {v813_views}')
+                else:
+                    logger.info('⚠️ V8.13: No views found, return 0')
+                # === END V8.13 ===
             elif result['data']['views'] == 0 and not PROXY_ENABLED:
                 result['debug']['proxy_used'] = False
                 result['debug']['proxy_note'] = 'Views=0 but proxy not configured'
@@ -2134,7 +2270,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.12.1-multi-source-url',
+        'version': '8.13-extract-views-share-v',
     })
 
 
@@ -2158,7 +2294,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.12.1-multi-source-url',
+        'version': '8.13-extract-views-share-v',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
