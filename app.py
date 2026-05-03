@@ -1,48 +1,44 @@
 """
-Rise City Facebook Scraper API - V8.14.1 🎩 DISABLE UNRELIABLE V8.13 (TRIỆT ĐỂ)
-BASE: V8.13 (EXTRACT VIEWS FOR LIVE)
-PATCH MỚI V8.14 (FIX TRIỆT ĐỂ DETECTION):
+Rise City Facebook Scraper API - V8.15 🎩 REELS URL FALLBACK FOR LIVE
+BASE: V8.14.1 (DISABLE UNRELIABLE V8.13)
+PATCH MỚI V8.15 (FIX VIEWS = 0 CHO LIVE BẰNG REELS URL):
 
-  ROOT CAUSE TẤT CẢ V8.11 → V8.13 BUGS:
-  - Detect live qua HTML/cookies/redirect → KHÔNG RELIABLE
-  - Khi cookies expired → desktop login wall → HTML rỗng
-  - V8.12 detection chỉ đọc field debug có sau khi mode chạy
-  - → signals trống → proxy chạy → views = 61K SAI
+  CONTEXT:
+  - V8.14.1 trả views=0 cho video live /share/v/ (an toàn)
+  - User muốn lấy đúng views (vd: 3,600 cho video Diệu Nguyễn UI)
+  - UI Reels của FB hiển thị views (icon 👁 + "3,6K")
+  
+  ROOT CAUSE V8.14.1 KHÔNG LẤY VIEWS:
+  - URL /share/v/XXXX/ → redirect tới story.php → login wall
+  - Cookies không work với story.php format
+  - HTML iphone15 chỉ là login wall, không có data
+  
+  FIX V8.15 (Reels URL convert):
+  - Extract post_id từ:
+    * final_url chứa story_fbid=XXXX
+    * og:url HTML pattern (.../posts/.../{post_id}/)
+    * canonical URL
+  - Build URL Reels: https://www.facebook.com/reel/{post_id}
+  - Try scrape với URL Reels + cookies (bypass login wall)
+  - Reels Player UI có "lượt xem" dạng "3,6K"
+  - search_views_in_text parse được
+  - Nếu success → use views; nếu fail → fallback views=0
 
-  FIX V8.14 (URL INPUT CHECK):
-  - Function is_live_replay_url_v814(url) check ngay đầu hàm scrape
-  - Patterns:
-    * '/share/v/' = SHARE VIDEO LINK (live replay, 100% accurate)
-    * '/live/'    = DIRECT LIVE URL
-    * 'live_video_id=' = URL parameter
-  - Negative patterns (rule out reels):
-    * '/share/r/' = SHARE REEL (NOT live)
-    * '/reel/'    = Direct reel (NOT live)
-  - Logic: nếu match POSITIVE và KHÔNG match NEGATIVE → là live
-  - Set flag is_live_replay_input ngay từ đầu
-  - SKIP proxy nếu flag = True
+  WORKFLOW V8.15 (chỉ kích hoạt cho live videos):
+  1. V8.14 detect /share/v/ → set is_live_replay_input = True
+  2. SKIP proxy (V8.14)
+  3. SKIP V8.13 (V8.14.1)
+  4. NEW: TRY Reels URL with cookies
+  5. Nếu views > 0 → use; else → views=0
 
-  COMBINED LOGIC:
-  - is_live_replay_final = is_live_replay_input OR is_live_replay_v812
-  - Cả 2 phải False mới chạy proxy
-  - V8.14 input check là PRIMARY (reliable)
-  - V8.12 HTML check là FALLBACK
-
-  EXPECTED CHO NGỌC NGUYỄN VIDEO (V8.14):
-  - v814_is_live_replay_input: true ✅
-  - v814_final_decision: true ✅
-  - proxy_used: false ✅ (KHÔNG còn 61K SAI)
-  - views: 0 hoặc 3,600 (nếu V8.13 extract được)
-  - likes: 21, comments: 11, shares: 2
-
-LOGIC HOÀN CHỈNH V8.14:
-1. URL input check (V8.14) → set live flag
-2. Desktop mode → views + V8.10 engagement
-3. Mobile mode → V8.11 SMART TRUNCATE first post
-4. /videos/ URL fallback → views + smart match
-5. Reel Grid → views fallback
-6. VN Proxy → CHỈ cho non-live videos (V8.14 + V8.12.1 combined)
-7. V8.13 NEW: Live replay → extract views từ iphone15 HTML pattern
+  EXPECTED CHO NGỌC NGUYỄN VIDEO (V8.15):
+  - v815_extracted_post_id: "1282197544109505"
+  - v815_reels_url: "https://www.facebook.com/reel/1282197544109505"
+  - views: 3,600 (nếu Reels URL work) ✅
+  
+  ANTI-BREAK:
+  - V8.15 CHỈ chạy cho live videos (URL match /share/v/)
+  - KHÔNG ảnh hưởng video reel/regular (đã work tốt)
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -748,6 +744,177 @@ def extract_views_for_share_v_live(html, mobile_innertext, debug_info=None):
     debug_info['v813_views'] = smallest
     debug_info['v813_source'] = 'min_fallback'
     return smallest
+
+
+# ==========================================
+# V8.15: REELS PLAYER URL FALLBACK FOR LIVE
+# Khi /share/v/ bị login wall → thử /reel/{post_id}
+# ==========================================
+
+def extract_post_id_from_live_response(result):
+    """
+    V8.15: Extract post_id từ response data của live video.
+    
+    Sources to try:
+    1. final_url chứa story_fbid=XXXX (URL-decoded)
+    2. og:url trong html (.../posts/.../{post_id}/)
+    3. canonical URL (.../posts/.../{post_id}/)
+    4. iphone15_html_content (sau khi có)
+    
+    Returns: str post_id hoặc None
+    """
+    from urllib.parse import unquote
+    
+    debug = result.get('debug', {})
+    
+    # Source 1: final_url với story_fbid= (decode URL-encoded chars)
+    final_url = debug.get('final_url', '') or ''
+    decoded_final_url = unquote(final_url)
+    m = re.search(r'story_fbid=(\d+)', decoded_final_url)
+    if m:
+        return m.group(1)
+    
+    # Source 2 & 3: HTML content (iphone15 hoặc desktop)
+    html_sources = [
+        debug.get('iphone15_html_content', ''),
+    ]
+    
+    for html_text in html_sources:
+        if not html_text:
+            continue
+        
+        # og:url pattern: .../posts/.../{post_id}/
+        m = re.search(r'og:url" content="[^"]*?/posts/[^"]*?/(\d{10,20})/', html_text)
+        if m:
+            return m.group(1)
+        
+        # canonical pattern
+        m = re.search(r'canonical" href="[^"]*?/posts/[^"]*?/(\d{10,20})/', html_text)
+        if m:
+            return m.group(1)
+        
+        # webliteSharingWrappedUrlPFbId might give post_id
+        m = re.search(r'pageID["\s:]+(\d{10,20})', html_text)
+        if m:
+            return m.group(1)
+    
+    return None
+
+
+def try_reels_url_for_live(p, original_url, cookies, result):
+    """
+    V8.15: Convert /share/v/ URL to /reel/{post_id} and try scrape.
+    
+    Workflow:
+    1. Extract post_id from existing data
+    2. Build https://www.facebook.com/reel/{post_id}
+    3. Try desktop_cookies mode with this new URL
+    4. If success → use views; else → return 0
+    
+    Returns: int views, hoặc 0 nếu fail
+    """
+    try:
+        post_id = extract_post_id_from_live_response(result)
+        result['debug']['v815_extracted_post_id'] = post_id
+        
+        if not post_id:
+            result['debug']['v815_skip_reason'] = 'no_post_id'
+            logger.warning('⚠️ V8.15: No post_id extracted, cannot try Reels URL')
+            return 0
+        
+        # Build Reels URL
+        reels_url = f'https://www.facebook.com/reel/{post_id}'
+        result['debug']['v815_reels_url'] = reels_url
+        logger.info(f'🎯 V8.15: Try Reels URL: {reels_url}')
+        
+        # Open new browser context with cookies
+        from playwright.sync_api import sync_playwright
+        
+        # Use existing playwright instance via 'p'
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-gpu',
+            ]
+        )
+        
+        try:
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1280, 'height': 800},
+                locale='vi-VN',
+            )
+            context.add_cookies(cookies)
+            page = context.new_page()
+            
+            # Navigate
+            try:
+                page.goto(reels_url, wait_until='domcontentloaded', timeout=20000)
+            except Exception as nav_err:
+                result['debug']['v815_nav_error'] = str(nav_err)[:200]
+                logger.warning(f'V8.15 navigation error: {nav_err}')
+                context.close()
+                browser.close()
+                return 0
+            
+            time.sleep(3)
+            simulate_human(page)
+            time.sleep(2)
+            
+            # Get HTML
+            html = page.content()
+            innertext = ''
+            try:
+                innertext = page.evaluate('document.body.innerText || ""')
+            except:
+                pass
+            
+            final_url = page.url
+            result['debug']['v815_final_url'] = final_url
+            result['debug']['v815_html_length'] = len(html)
+            result['debug']['v815_innertext_length'] = len(innertext)
+            result['debug']['v815_innertext_preview'] = innertext[:300]
+            
+            # Check if redirected to login again
+            if 'login' in final_url.lower():
+                result['debug']['v815_skip_reason'] = 'redirected_login'
+                logger.warning('⚠️ V8.15: Reels URL also redirects to login')
+                context.close()
+                browser.close()
+                return 0
+            
+            # Search views
+            all_text = html + '\n' + innertext
+            views = search_views_in_text(all_text)
+            
+            result['debug']['v815_views_found'] = views
+            
+            context.close()
+            browser.close()
+            
+            if views > 0:
+                logger.info(f'✅ V8.15: Reels URL got views={views}')
+                return views
+            else:
+                logger.warning('⚠️ V8.15: No views from Reels URL')
+                return 0
+                
+        except Exception as e:
+            logger.warning(f'V8.15 inner error: {e}')
+            try:
+                browser.close()
+            except:
+                pass
+            return 0
+            
+    except Exception as e:
+        result['debug']['v815_error'] = str(e)[:200]
+        logger.exception(f'V8.15 outer error: {e}')
+        return 0
 
 
 def simulate_human(page):
@@ -2061,10 +2228,23 @@ def scrape_with_playwright(url):
                 # Lý do: HTML iphone15 chỉ là login wall, không có data thực
                 # V8.13 lấy "9" từ HTML → tưởng "9K" → 9,000 (SAI)
                 # Conservative: trả views=0, user biết chưa lấy được
-                logger.info('⚠️ V8.14.1: SKIP V8.13 extraction for live (unreliable). Views=0')
+                logger.info('⚠️ V8.14.1: SKIP V8.13 extraction for live (unreliable)')
                 result['debug']['v8141_skipped_v813'] = True
                 result['debug']['v8141_reason'] = 'live_html_unreliable_better_zero_than_wrong'
                 # === END V8.14.1 ===
+                
+                # === V8.15: Try Reels URL với cookies (bypass login wall) ===
+                logger.info('🎯 V8.15: Try Reels URL fallback for live...')
+                v815_views = try_reels_url_for_live(p, url, cookies, result)
+                
+                if v815_views > 0:
+                    result['data']['views'] = v815_views
+                    logger.info(f'✅ V8.15 SUCCESS: Got {v815_views} views from Reels URL')
+                    result['debug']['v815_used'] = True
+                else:
+                    logger.info('⚠️ V8.15: Reels URL also failed, return 0')
+                    result['debug']['v815_used'] = False
+                # === END V8.15 ===
             elif result['data']['views'] == 0 and not PROXY_ENABLED:
                 result['debug']['proxy_used'] = False
                 result['debug']['proxy_note'] = 'Views=0 but proxy not configured'
@@ -2342,7 +2522,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.14.1-disable-unreliable-v813',
+        'version': '8.15-reels-url-fallback',
     })
 
 
@@ -2366,7 +2546,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.14.1-disable-unreliable-v813',
+        'version': '8.15-reels-url-fallback',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
