@@ -1,31 +1,36 @@
 """
-Rise City Facebook Scraper API - V8.10 🎩 ENGAGEMENT FROM HTML JSON
-BASE: V8.9
-PATCH MỚI V8.10 (FIX TRIỆT ĐỂ LIKES/COMMENTS/SHARES = 0):
-  ROOT CAUSE: Mobile mode bị FB login wall → engagement extraction = 0
-  
-  GIẢI PHÁP V8.10:
-  - Thêm hàm extract_engagement_from_html() parse JSON patterns trong HTML
-  - Patterns:
-    * LIKES: reaction_count, i18n_reaction_count, top_reactions, reactor_count
-    * COMMENTS: comment_count, total_comment_count, i18n_comment_count
-    * SHARES: share_count, i18n_share_count, reshare_count
-  - Window search: 5000 chars quanh post_id (chính xác)
-  - Fallback: full HTML search nếu không có post_id
-  - Priority order: ưu tiên field FB UI hiển thị
-  - Sanity check: < 1M để loại bỏ page total
-  
-  INTEGRATION:
-  - Áp dụng trong try_desktop_with_cookies (mode 1)
-  - Giữ nguyên mobile mode logic (mobile vẫn ưu tiên nếu work)
-  - V8.10 chỉ kick in khi mobile fail hoặc trả 0
+Rise City Facebook Scraper API - V8.11 🎩 ANTI-MULTI-POSTS + LIVE PROXY GUARD
+BASE: V8.10
+PATCH MỚI V8.11 (FIX 2 BUGS NGHIÊM TRỌNG):
 
-LOGIC HOÀN CHỈNH V8.10:
-1. Desktop mode → extract views + V8.10 engagement (NEW)
-2. Mobile mode → backup engagement (nếu desktop fail)
-3. /videos/ URL fallback → views (nếu cần)
+  BUG 1: Mobile mode parse cộng dồn engagement của nhiều posts
+  Case: Video Ngọc Nguyễn live, FB hiển thị feed có 3 posts
+    - Post target: 21 likes, 11 cmt, 0 shares
+    - Post 2: 8 likes, 4 cmt, 0 shares
+    - Post 3: 29 likes, 12 cmt, 1 shares
+    Tổng cộng nhầm: 94 likes (sai 4.5 lần)
+  
+  FIX V8.11:
+    - Count icon LIKE trong target_text (sau isolation)
+    - Nếu > 2 icon LIKE → có nhiều posts → SKIP mobile engagement
+    - Trả 0 (an toàn) thay vì cộng dồn sai
+
+  BUG 2: Proxy fallback lấy peak concurrent viewers cho live replay
+  Case: Video Ngọc Nguyễn live actual=3,500 → proxy trả 61,704 (peak live)
+  
+  FIX V8.11:
+    - Detect live replay markers TRƯỚC khi gọi proxy
+    - Markers: was_live_broadcast, broadcast_status VOD_READY,
+      is_live_streaming, live_video_id, format_detected=video_live, /share/v/
+    - Nếu là live replay → SKIP proxy (avoid wrong views)
+    - Skip lý do: 'v811_live_replay_skip_proxy'
+
+LOGIC HOÀN CHỈNH V8.11:
+1. Desktop mode → views + V8.10 engagement
+2. Mobile mode → backup engagement (V8.11 guard chống multi-posts)
+3. /videos/ URL fallback → views + smart match
 4. Reel Grid → views fallback
-5. VN Proxy → last resort
+5. VN Proxy → CHỈ cho non-live videos (V8.11)
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
@@ -242,6 +247,34 @@ def parse_mobile_engagement(innertext, debug_info):
     
     debug_info['isolation_marker'] = matched_marker
     debug_info['isolation_length'] = len(target_text)
+    
+    # === V8.11: GUARD AGAINST MULTI-POSTS FEED ===
+    # Bug case (Ngọc Nguyễn live): isolation không cắt được → target_text có
+    # nhiều posts → cộng dồn engagement → SAI hoàn toàn.
+    # Nếu target_text > 1500 chars VÀ chứa nhiều icon LIKE/CMT → có nhiều posts.
+    
+    # Count icon sets trong target_text
+    REEL_LIKE_CHECK  = '\U000F0378'
+    VID_LIKE_CHECK   = '\U000F0925'
+    likes_icon_count = target_text.count(REEL_LIKE_CHECK) + target_text.count(VID_LIKE_CHECK)
+    
+    debug_info['v811_target_length'] = len(target_text)
+    debug_info['v811_likes_icon_count'] = likes_icon_count
+    
+    # Nếu target có > 2 icon LIKE → likely là feed với nhiều posts → skip
+    if likes_icon_count > 2:
+        debug_info['v811_skip_reason'] = 'multi_posts_detected'
+        debug_info['v83_engagement'] = {'likes': 0, 'comments': 0, 'shares': 0}
+        logger.warning(f'⚠️ V8.11: Detected {likes_icon_count} posts in feed, skipping mobile engagement')
+        return data  # Return zero engagement - safer than wrong values
+    
+    # Nếu target_text quá dài VÀ không có Reel marker rõ ràng → skip
+    if len(target_text) > 1800 and likes_icon_count > 1:
+        debug_info['v811_skip_reason'] = 'target_too_long'
+        debug_info['v83_engagement'] = {'likes': 0, 'comments': 0, 'shares': 0}
+        logger.warning(f'⚠️ V8.11: Target text {len(target_text)} chars too long, skipping')
+        return data
+    # === END V8.11 GUARD ===
     
     # Step 2: Detect icon set
     REEL_LIKE  = '\U000F0378'
@@ -1705,13 +1738,41 @@ def scrape_with_playwright(url):
                             continue
             # === END V8.5 /videos/ URL FALLBACK ===
             
-            # === V8.2 SMART ROUTING: Retry với VN Proxy nếu views=0 ===
-            # IMPORTANT: Phải gọi TRONG `with sync_playwright()` block,
-            # pass `p` instance để tránh asyncio loop conflict.
+            # === V8.11 SMART ROUTING: Skip proxy cho live replay (avoid wrong views) ===
+            # Bug case (Ngọc Nguyễn live): proxy lấy peak concurrent viewers (61K)
+            # thay vì replay views (3.5K). Nếu là live replay → KHÔNG dùng proxy.
             result['debug']['proxy_used'] = False
             result['debug']['proxy_views'] = 0
             
-            if (result['data']['views'] == 0 and PROXY_ENABLED):
+            # V8.11: Detect live replay markers
+            is_live_replay_v811 = False
+            try:
+                if html and len(html) > 1000:
+                    live_markers_v811 = [
+                        '"was_live_broadcast":true',
+                        '"broadcast_status":"VOD_READY"',
+                        '"broadcast_status":"LIVE_STOPPED"',
+                        '"is_live_streaming"',
+                        '"live_video_id"',
+                        '"liveBroadcastId"',
+                    ]
+                    is_live_replay_v811 = any(m in html for m in live_markers_v811)
+                
+                # Fallback: detect via final_url
+                if not is_live_replay_v811:
+                    final_url_check = result.get('debug', {}).get('iphone15_url_after_redirect', '')
+                    if '/share/v/' in final_url_check or '/share/v/' in url:
+                        is_live_replay_v811 = True
+                
+                # Fallback: detect via format_detected
+                if result.get('debug', {}).get('format_detected') == 'video_live':
+                    is_live_replay_v811 = True
+            except:
+                pass
+            
+            result['debug']['v811_is_live_replay_global'] = is_live_replay_v811
+            
+            if (result['data']['views'] == 0 and PROXY_ENABLED and not is_live_replay_v811):
                 logger.info('🎩 Views=0, retry với VN residential proxy...')
                 proxy_views = try_vn_proxy_for_views(p, url, cookies, result)
                 result['debug']['proxy_used'] = True
@@ -1720,12 +1781,15 @@ def scrape_with_playwright(url):
                 if proxy_views > 0:
                     result['data']['views'] = proxy_views
                     logger.info(f'✅ VN Proxy fix views=0! Got {proxy_views} views')
+            elif is_live_replay_v811 and result['data']['views'] == 0:
+                logger.warning('⚠️ V8.11: SKIP proxy cho live replay (avoid peak viewer bug)')
+                result['debug']['proxy_skipped_reason'] = 'v811_live_replay_skip_proxy'
             elif result['data']['views'] == 0 and not PROXY_ENABLED:
                 result['debug']['proxy_used'] = False
                 result['debug']['proxy_note'] = 'Views=0 but proxy not configured'
             else:
                 result['debug']['proxy_skipped_reason'] = 'views_already_found'
-            # === END V8.2 SMART ROUTING ===
+            # === END V8.11 SMART ROUTING ===
             
             browser.close()
             
@@ -1997,7 +2061,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.10-engagement-from-html',
+        'version': '8.11-anti-multi-posts',
     })
 
 
@@ -2021,7 +2085,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.10-engagement-from-html',
+        'version': '8.11-anti-multi-posts',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
