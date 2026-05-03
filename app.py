@@ -1,47 +1,39 @@
 """
-Rise City Facebook Scraper API - V8.12 🎩 URL-BASED LIVE DETECTION + SMART TRUNCATE
-BASE: V8.11 SMART TRUNCATE
-PATCH MỚI V8.12 (FIX VIEWS WRONG VỚI LIVE REPLAY KHI COOKIES EXPIRED):
+Rise City Facebook Scraper API - V8.12.1 🎩 MULTI-SOURCE URL DETECTION
+BASE: V8.12 (URL-BASED LIVE DETECTION)
+PATCH MỚI V8.12.1 (FIX V8.12 DETECTION BUG):
 
-  ROOT CAUSE V8.11 OLD VẪN BUG:
-  - V8.11 detect live qua HTML markers (was_live_broadcast, etc.)
-  - Khi cookies expired → desktop bị login wall → HTML rỗng
-  - V8.11 không tìm thấy markers → cho rằng KHÔNG phải live
-  - Chạy proxy → proxy lấy peak viewers (61K) thay vì replay views (3.5K)
-  
-  FIX V8.12 (URL-BASED DETECTION):
-  Detect live replay từ MULTIPLE URL signals (không cần HTML):
-    1. URL pattern '/share/v/' (FB share link cho live)
-    2. final_url chứa '/share/v/' sau redirect
-    3. final_url chứa 'story.php' hoặc 'story_fbid=' (legacy live format)
-    4. final_url chứa '/login/?next=' (cookies expired = thường live private)
-    5. URL có 'live_video_id=' parameter
-    6. mobile_innertext có "phát trực tiếp" (Vietnamese)
-    7. HTML markers (V8.11 logic, vẫn giữ làm fallback)
-    8. format_detected = 'video_live'
-  
-  Detection rule: ≥ 1 signal → SKIP proxy
-  Conservative: prefer false positive (skip nhầm) hơn để proxy lấy số sai
+  ROOT CAUSE V8.12:
+  - V8.12 chỉ đọc 'iphone15_url_after_redirect' từ debug
+  - Field này CHỈ có sau khi iphone15 mode chạy
+  - Khi detection chạy TRƯỚC iphone15 → field empty
+  - → v812_live_signals = [] → chạy proxy → views=61K SAI
 
-  ENGAGEMENT (giữ V8.11 SMART TRUNCATE):
-  - Find tất cả icon LIKE positions
-  - Nếu có ≥ 2 positions → có nhiều posts → cắt trước icon #2
-  - Lùi tới newline gần nhất → giữ post target nguyên vẹn
-  - Parse engagement chỉ trong post đầu (target)
+  FIX V8.12.1 (MULTI-SOURCE READ):
+  - Đọc final_url từ ROOT level (luôn có)
+  - Đọc iphone15_url_after_redirect làm fallback
+  - Combine cả 3 nguồn: url + final_url_root + final_url_iphone
+  - Thêm Signal 6: error == "Redirected to login"
+  - Loosen 'login_redirect' check: cũng match 'facebook.com/login'
 
-LOGIC HOÀN CHỈNH V8.12:
+  EXPOSED MỚI:
+  - v812_final_url_root (debug)
+  - v812_final_url_iphone (debug)
+  - signal 'error_redirect_login' (mới)
+
+  EXPECTED CHO NGỌC NGUYỄN VIDEO (V8.12.1):
+  - v812_is_live_replay: true ✅
+  - v812_live_signals: 5 signals
+  - proxy_used: false (skip đúng) ✅
+  - views: 0 (KHÔNG còn 61K SAI) ✅
+  - likes: 21, comments: 11, shares: 2 (smart truncate vẫn work)
+
+LOGIC HOÀN CHỈNH V8.12.1:
 1. Desktop mode → views + V8.10 engagement
 2. Mobile mode → V8.11 SMART TRUNCATE first post
 3. /videos/ URL fallback → views + smart match
-4. Reel Grid → views fallback
-5. VN Proxy → CHỈ cho non-live videos (V8.12 URL detection)
-
-EXPECTED CHO NGỌC NGUYỄN VIDEO:
-- views = 0 (skip proxy đúng)
-- likes = 21 (V8.11 smart truncate)
-- comments = 11
-- shares = 2 (UI=0, edge case)
-- v812_live_signals = ['url_share_v', 'redirect_share_v', 'login_redirect']
+4. Reel Grid → views fallback  
+5. VN Proxy → CHỈ cho non-live videos (V8.12.1 multi-source detection)
 
 ENV VARS REQUIRED ON RENDER:
 - API_SECRET, FB_COOKIES_PATH
