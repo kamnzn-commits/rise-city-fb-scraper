@@ -1,5 +1,5 @@
 """
-Rise City Facebook Scraper API - V8.14 🎩 URL INPUT LIVE DETECTION (TRIỆT ĐỂ)
+Rise City Facebook Scraper API - V8.14.1 🎩 DISABLE UNRELIABLE V8.13 (TRIỆT ĐỂ)
 BASE: V8.13 (EXTRACT VIEWS FOR LIVE)
 PATCH MỚI V8.14 (FIX TRIỆT ĐỂ DETECTION):
 
@@ -2057,24 +2057,14 @@ def scrape_with_playwright(url):
                     logger.warning(f'⚠️ V8.12: SKIP proxy cho live replay. Signals: {v812_live_signals}')
                     result['debug']['proxy_skipped_reason'] = 'v812_live_replay_skip_proxy'
                 
-                # V8.13: Try extract views (giữ nguyên cho live videos)
-                logger.info('🎩 V8.13: Try extract views for live replay...')
-                
-                iphone15_html = result.get('debug', {}).get('iphone15_html_content', '') or html or ''
-                mobile_text_for_views = result.get('debug', {}).get('mobile_innertext_sample', '') or ''
-                
-                v813_views = extract_views_for_share_v_live(
-                    iphone15_html, 
-                    mobile_text_for_views, 
-                    result['debug']
-                )
-                
-                if v813_views > 0:
-                    result['data']['views'] = v813_views
-                    logger.info(f'✅ V8.13 found views for live: {v813_views}')
-                else:
-                    logger.info('⚠️ V8.13: No views found, return 0 (better than wrong)')
-                # === END V8.13 ===
+                # V8.14.1: SKIP V8.13 view extraction (unreliable)
+                # Lý do: HTML iphone15 chỉ là login wall, không có data thực
+                # V8.13 lấy "9" từ HTML → tưởng "9K" → 9,000 (SAI)
+                # Conservative: trả views=0, user biết chưa lấy được
+                logger.info('⚠️ V8.14.1: SKIP V8.13 extraction for live (unreliable). Views=0')
+                result['debug']['v8141_skipped_v813'] = True
+                result['debug']['v8141_reason'] = 'live_html_unreliable_better_zero_than_wrong'
+                # === END V8.14.1 ===
             elif result['data']['views'] == 0 and not PROXY_ENABLED:
                 result['debug']['proxy_used'] = False
                 result['debug']['proxy_note'] = 'Views=0 but proxy not configured'
@@ -2352,7 +2342,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.14-url-input-detection',
+        'version': '8.14.1-disable-unreliable-v813',
     })
 
 
@@ -2376,7 +2366,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.14-url-input-detection',
+        'version': '8.14.1-disable-unreliable-v813',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
