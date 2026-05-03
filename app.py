@@ -1798,15 +1798,25 @@ def scrape_with_playwright(url):
                 if result.get('debug', {}).get('format_detected') == 'video_live':
                     v812_live_signals.append('format_video_live')
                 
-                # === V8.12 NEW: URL-BASED DETECTION ===
-                # Khi cookies expired, HTML rỗng → check URL patterns
+                # === V8.12.1: Multi-source URL detection ===
+                # Bug V8.12: chỉ đọc iphone15_url_after_redirect (chỉ có sau iphone15)
+                # → Khi iphone15 không chạy → field empty → không detect được
+                # 
+                # FIX V8.12.1: Combine MULTIPLE URL sources
                 
-                final_url_check = result.get('debug', {}).get('iphone15_url_after_redirect', '') or ''
+                final_url_check = ''
+                final_url_root = result.get('final_url', '') or ''
+                final_url_iphone = result.get('debug', {}).get('iphone15_url_after_redirect', '') or ''
+                # Combine all sources into 1 string for checking
+                final_url_check = f'{url} {final_url_root} {final_url_iphone}'
+                
+                result['debug']['v812_final_url_root'] = final_url_root
+                result['debug']['v812_final_url_iphone'] = final_url_iphone
                 
                 # Signal 1: /share/v/ URL pattern (FB share link cho video live)
                 if '/share/v/' in url:
                     v812_live_signals.append('url_share_v')
-                if '/share/v/' in final_url_check:
+                if '/share/v/' in final_url_check and 'url_share_v' not in v812_live_signals:
                     v812_live_signals.append('redirect_share_v')
                 
                 # Signal 2: story.php?story_fbid= (legacy live post format)
@@ -1814,11 +1824,11 @@ def scrape_with_playwright(url):
                     v812_live_signals.append('legacy_story_php')
                 
                 # Signal 3: Login redirect (cookies expired = thường là live private)
-                if '/login/?next=' in final_url_check or '/login.php' in final_url_check:
+                if '/login/?next=' in final_url_check or '/login.php' in final_url_check or 'facebook.com/login' in final_url_check:
                     v812_live_signals.append('login_redirect')
                 
                 # Signal 4: live_video_id trong URL params
-                if 'live_video_id=' in url or 'live_video_id=' in final_url_check:
+                if 'live_video_id=' in final_url_check:
                     v812_live_signals.append('url_live_video_id')
                 
                 # Signal 5: Mobile innertext có "phát trực tiếp" (FB Live in Vietnamese)
@@ -1828,6 +1838,10 @@ def scrape_with_playwright(url):
                     if kw in mobile_innertext_check:
                         v812_live_signals.append(f'mobile_kw:{kw[:20]}')
                         break
+                
+                # Signal 6 (NEW): error = "Redirected to login"
+                if result.get('error') == 'Redirected to login':
+                    v812_live_signals.append('error_redirect_login')
                 
                 # Detection rule: ≥ 1 signal → likely live replay
                 # (Conservative: prefer false positive vs let proxy lấy số sai)
@@ -2128,7 +2142,7 @@ def home():
     return jsonify({
         'status': 'ok',
         'service': 'Rise City Facebook Scraper \U0001f3a9',
-        'version': '8.12-url-live-detection',
+        'version': '8.12.1-multi-source-url',
     })
 
 
@@ -2152,7 +2166,7 @@ def health():
         'cookies_count': cookies_count,
         'chromium_ok': chromium_ok,
         'chromium_path': chromium_path,
-        'version': '8.12-url-live-detection',
+        'version': '8.12.1-multi-source-url',
         'proxy_enabled': PROXY_ENABLED,
         'proxy_host': PROXY_HOST if PROXY_ENABLED else None,
         'proxy_country': 'VN' if PROXY_ENABLED else None,
